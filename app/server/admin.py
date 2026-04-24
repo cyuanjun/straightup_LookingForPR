@@ -12,6 +12,7 @@ Telegram is reserved for parent ↔ agent interactions, ✓ Sent taps, /help, /s
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, time, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
@@ -20,6 +21,7 @@ from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import settings
+from app.db import conversations as convo_repo
 from app.db import events as events_repo
 from app.db import families as families_repo
 from app.db import medications as medications_repo
@@ -68,15 +70,20 @@ async def root_redirect():
 
 @router.get("/{family_id}", response_class=HTMLResponse)
 async def family_dashboard(family_id: str) -> HTMLResponse:
-    family = await families_repo.get(family_id)
+    today_dow = (datetime.now().weekday() + 1) % 7
+    family, all_users, meds, rotation, raw_events, on_duty_today_id = await asyncio.gather(
+        families_repo.get(family_id),
+        users_repo.list_all(family_id),
+        medications_repo.list_active(family_id),
+        rotation_repo.list_for_family(family_id),
+        events_repo.recent_for_briefing(family_id, window_days=1),
+        rotation_repo.on_duty(family_id, today_dow),
+    )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
 
-    all_users = await users_repo.list_all(family_id)
-    meds = await medications_repo.list_active(family_id)
-    rotation = await rotation_repo.list_for_family(family_id)
-    state = await families_repo.state(family_id)
-    missing = await families_repo.missing_fields(family_id) if state == "inactive_missing_fields" else []
+    state = families_repo.compute_state(family)
+    missing = families_repo.compute_missing(family) if state == "inactive_missing_fields" else []
 
     from app.scheduler.scheduler import get_scheduler
 
@@ -87,7 +94,6 @@ async def family_dashboard(family_id: str) -> HTMLResponse:
     family_jobs = [j for j in all_jobs if (j.args or [None])[0] == family_id]
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    raw_events = await events_repo.recent_for_briefing(family_id, window_days=1)
     events = sorted(
         [
             e
@@ -101,8 +107,6 @@ async def family_dashboard(family_id: str) -> HTMLResponse:
     user_by_id = {u["id"]: u for u in all_users}
     parent = user_by_id.get(family.get("parent_user_id"))
     primary = user_by_id.get(family.get("primary_caregiver_user_id"))
-    today_dow = (datetime.now().weekday() + 1) % 7
-    on_duty_today_id = await rotation_repo.on_duty(family_id, today_dow)
     on_duty_today = user_by_id.get(on_duty_today_id) if on_duty_today_id else None
 
     status = _compute_status(state, missing, events, family_jobs)
@@ -133,28 +137,144 @@ async def family_dashboard(family_id: str) -> HTMLResponse:
 
 @router.get("/{family_id}/medications", response_class=HTMLResponse)
 async def medications_page(family_id: str) -> HTMLResponse:
-    family = await families_repo.get(family_id)
+    family, meds = await asyncio.gather(
+        families_repo.get(family_id),
+        medications_repo.list_active(family_id),
+    )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
 
-    meds = await medications_repo.list_active(family_id)
-    state = await families_repo.state(family_id)
-    missing = await families_repo.missing_fields(family_id) if state == "inactive_missing_fields" else []
+    state = families_repo.compute_state(family)
+    missing = families_repo.compute_missing(family) if state == "inactive_missing_fields" else []
 
     html = _render_medications(family=family, state=state, missing=missing, meds=meds)
     return HTMLResponse(html)
 
 
-@router.get("/{family_id}/settings", response_class=HTMLResponse)
-async def settings_page(family_id: str, saved: str | None = None) -> HTMLResponse:
-    family = await families_repo.get(family_id)
+@router.get("/{family_id}/logs", response_class=HTMLResponse)
+async def logs_page(
+    family_id: str,
+    event_type: str | None = None,
+    days: int = 7,
+    briefing: str | None = None,
+) -> HTMLResponse:
+    # Clamp days to a sane range
+    days = max(1, min(days, 90))
+    # Adherence is always over 30 days — fetch in one shot if days covers it, else fetch separately.
+    adherence_window = max(days, 30)
+
+    family, all_users, raw_adherence_events, conversations, meds = await asyncio.gather(
+        families_repo.get(family_id),
+        users_repo.list_all(family_id),
+        events_repo.recent_for_briefing(family_id, window_days=adherence_window),
+        convo_repo.list_for_family(family_id, limit=200),
+        medications_repo.list_active(family_id),
+    )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
 
-    all_users = await users_repo.list_all(family_id)
-    rotation = await rotation_repo.list_for_family(family_id)
-    state = await families_repo.state(family_id)
-    missing = await families_repo.missing_fields(family_id) if state == "inactive_missing_fields" else []
+    user_by_id = {u["id"]: u for u in all_users}
+    state = families_repo.compute_state(family)
+    missing = families_repo.compute_missing(family) if state == "inactive_missing_fields" else []
+
+    # Events (filtered by the user-selected `days` window, a subset of raw_adherence_events)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    raw_events = [
+        e
+        for e in raw_adherence_events
+        if datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) >= cutoff
+    ]
+    events = sorted(
+        [e for e in raw_events if (not event_type or e["type"] == event_type)],
+        key=lambda e: e["created_at"],
+        reverse=True,
+    )
+
+    # Adherence per active medication over last 30 days (reuses raw_adherence_events)
+    adherence = _adherence_summary(meds, raw_adherence_events, days=30)
+
+    # Unique event types actually seen in this window (for the filter dropdown)
+    seen_types = sorted({e["type"] for e in raw_events})
+
+    # Briefings — recent files from cache, with the just-generated token (if any) highlighted
+    from app.briefing import storage as briefing_storage
+
+    briefings = briefing_storage.list_recent(limit=8)
+
+    html = _render_logs(
+        family=family,
+        state=state,
+        missing=missing,
+        user_by_id=user_by_id,
+        events=events,
+        conversations=conversations,
+        adherence=adherence,
+        event_type=event_type,
+        days=days,
+        seen_types=seen_types,
+        briefings=briefings,
+        highlight_briefing_token=briefing,
+    )
+    return HTMLResponse(html)
+
+
+def _adherence_summary(meds: list[dict], all_events: list[dict], days: int = 30) -> list[dict]:
+    """For each active medication, count confirmations by timing + misses over last N days.
+
+    Pure function — takes pre-fetched events so the caller can parallelize the fetch.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out = []
+    for m in meds:
+        mid = m["id"]
+        confirmed_on_time = 0
+        confirmed_early = 0
+        confirmed_late = 0
+        missed = 0
+        for e in all_events:
+            if e.get("medication_id") != mid:
+                continue
+            ts = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
+            if ts < cutoff:
+                continue
+            if e["type"] == "med_confirmed":
+                timing = (e.get("payload") or {}).get("timing", "on_time")
+                if timing == "early":
+                    confirmed_early += 1
+                elif timing == "late":
+                    confirmed_late += 1
+                else:
+                    confirmed_on_time += 1
+            elif e["type"] == "med_missed":
+                missed += 1
+        total_confirmed = confirmed_on_time + confirmed_early + confirmed_late
+        total = total_confirmed + missed
+        out.append(
+            {
+                "medication": m,
+                "confirmed_on_time": confirmed_on_time,
+                "confirmed_early": confirmed_early,
+                "confirmed_late": confirmed_late,
+                "missed": missed,
+                "total": total,
+                "rate_pct": round(100 * total_confirmed / total) if total else 0,
+            }
+        )
+    return out
+
+
+@router.get("/{family_id}/settings", response_class=HTMLResponse)
+async def settings_page(family_id: str, saved: str | None = None) -> HTMLResponse:
+    family, all_users, rotation = await asyncio.gather(
+        families_repo.get(family_id),
+        users_repo.list_all(family_id),
+        rotation_repo.list_for_family(family_id),
+    )
+    if not family:
+        raise HTTPException(404, f"Family {family_id} not found")
+
+    state = families_repo.compute_state(family)
+    missing = families_repo.compute_missing(family) if state == "inactive_missing_fields" else []
     user_by_id = {u["id"]: u for u in all_users}
     today_dow = (datetime.now().weekday() + 1) % 7
 
@@ -364,6 +484,59 @@ async def set_group_chat(family_id: str, group_chat_id: str = Form(...)):
 
 
 # --- Handshake / group-link tokens ----------------------------------------
+
+
+@router.post("/{family_id}/briefing")
+async def generate_briefing(family_id: str):
+    """Compile + render a new GP briefing PDF; redirect back to Logs with the token."""
+    from app.briefing import compile as compile_mod
+    from app.briefing import render as render_mod
+    from app.briefing import storage as storage_mod
+
+    family = await families_repo.get(family_id)
+    if not family:
+        raise HTTPException(404, "Family not found")
+
+    parent = None
+    if family.get("parent_user_id"):
+        parent = await users_repo.by_id(family["parent_user_id"])
+    family_label = (parent or {}).get("display_name") or family_id[:8]
+
+    try:
+        markdown = await compile_mod.compile_briefing(family_id, window_days=42)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("compile_briefing failed")
+        raise HTTPException(500, "Briefing generation failed — see server logs")
+
+    token = storage_mod.new_token()
+    out_path = storage_mod.file_path(token)
+    qr_url = storage_mod.public_url(token)
+
+    render_mod.render_briefing_pdf(
+        markdown=markdown,
+        qr_url=qr_url,
+        family_label=family_label,
+        output_path=out_path,
+        window_days=42,
+    )
+
+    # Audit trail
+    await events_repo.insert(
+        family_id,
+        "briefing_generated",
+        payload={
+            "pdf_url": qr_url,
+            "event_window_start": (datetime.now(timezone.utc) - timedelta(days=42)).isoformat(),
+            "event_window_end": datetime.now(timezone.utc).isoformat(),
+            "token": token,
+        },
+    )
+
+    return RedirectResponse(
+        f"/admin/{family_id}/logs?briefing={token}#briefings", status_code=303
+    )
 
 
 @router.post("/{family_id}/generate-handshake")
@@ -981,6 +1154,46 @@ _STYLES = """
 
   .badge { background: #2d5ea8; color: white; font-size: 10px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
 
+  /* Adherence cards */
+  .ad-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .ad-card { background: #15151c; border: 1px solid #24242d; border-radius: 8px; padding: 14px 16px; }
+  .ad-title { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 14px; }
+  .ad-rate { margin-left: auto; font-size: 12px; font-weight: 700; color: #5ab55a; background: #1a2a1a; padding: 3px 10px; border-radius: 10px; }
+  .ad-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #2a2a34; margin-bottom: 10px; }
+  .ad-bar > div { transition: width 0.3s; }
+  .ad-meta-row { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: #9f9faf; }
+  .ad-meta { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.on { background: #2d7a2d; } .dot.early { background: #5a9adf; } .dot.late { background: #c27d00; } .dot.missed { background: #a83232; }
+
+  /* Conversations timeline */
+  .msg-list { display: flex; flex-direction: column; gap: 4px; max-height: 560px; overflow-y: auto; padding-right: 4px; }
+  .msg-row { background: #15151c; border: 1px solid #24242d; border-radius: 8px; padding: 10px 12px; }
+  .msg-row.msg-parent { border-left: 3px solid #5a9adf; }
+  .msg-row.msg-am { border-left: 3px solid #c79dff; }
+  .msg-row.msg-system { border-left: 3px solid #666; }
+  .msg-meta { display: flex; gap: 8px; align-items: center; font-size: 11px; color: #888; margin-bottom: 4px; }
+  .msg-ts { font-family: "SF Mono", ui-monospace, monospace; }
+  .msg-speaker { font-weight: 600; color: #e4e4ea; text-transform: capitalize; }
+  .lang-badge { background: #2a2a34; color: #c4a3ff; font-size: 10px; padding: 1px 6px; border-radius: 3px; font-family: "SF Mono", ui-monospace, monospace; }
+  .msg-body { font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
+
+  /* Logs filter bar */
+  .logs-filter { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 14px; padding: 10px 14px; background: #15151c; border: 1px solid #24242d; border-radius: 8px; flex-wrap: wrap; }
+  .logs-filter label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.05em; }
+  .logs-filter select { padding: 6px 10px; }
+
+  /* GP briefing */
+  .briefing-gen { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; background: linear-gradient(180deg, #1a1a22 0%, #15151c 100%); border: 1px solid #24242d; border-radius: 8px; }
+  .briefing-gen b { font-size: 14px; }
+  .briefing-list { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; }
+  .briefing-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #15151c; border: 1px solid #24242d; border-radius: 6px; }
+  .briefing-row.briefing-new { border-color: #2d7a2d; box-shadow: 0 0 0 1px #2d7a2d; }
+  .briefing-title { font-family: "SF Mono", ui-monospace, monospace; font-size: 13px; color: #c4a3ff; }
+  .briefing-actions { display: flex; gap: 8px; }
+  .btn-link { color: #5a9adf; text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid #2a4a7a; border-radius: 5px; }
+  .btn-link:hover { background: #1a2a3a; color: white; }
+
   /* Save toast */
   .toast {
     position: fixed; top: 22px; right: 22px;
@@ -1056,12 +1269,14 @@ _STYLES = """
 def _navbar(family_id: str, active: str) -> str:
     home_cls = "active" if active == "home" else ""
     meds_cls = "active" if active == "medications" else ""
+    logs_cls = "active" if active == "logs" else ""
     settings_cls = "active" if active == "settings" else ""
     return f"""
     <nav class="navbar">
       <div class="brand">AI-Care</div>
       <a href="/admin/{escape(family_id)}" class="{home_cls}">Home</a>
       <a href="/admin/{escape(family_id)}/medications" class="{meds_cls}">Medications</a>
+      <a href="/admin/{escape(family_id)}/logs" class="{logs_cls}">Logs</a>
       <a href="/admin/{escape(family_id)}/settings" class="{settings_cls}">Settings</a>
     </nav>"""
 
@@ -1108,6 +1323,170 @@ def _render_home(**ctx) -> str:
   {_events_timeline(ctx['events'], ctx['user_by_id'])}"""
 
     return _page_shell(family, ctx["state"], ctx["missing"], "home", content)
+
+
+def _render_logs(**ctx) -> str:
+    family = ctx["family"]
+    fam_id = family["id"]
+
+    adherence_html = _adherence_cards(ctx["adherence"])
+    convo_html = _conversations_timeline(ctx["conversations"], ctx["user_by_id"])
+    events_html = _events_timeline(ctx["events"], ctx["user_by_id"])
+    filter_html = _logs_filter_bar(
+        fam_id, ctx["event_type"], ctx["days"], ctx["seen_types"]
+    )
+    briefings_html = _briefings_section(
+        fam_id, ctx.get("briefings") or [], ctx.get("highlight_briefing_token")
+    )
+
+    content = f"""
+  <h2 id="briefings">GP briefing</h2>
+  {briefings_html}
+
+  <h2>Adherence (last 30 days)</h2>
+  {adherence_html}
+
+  <h2>Conversations — Aunty May ↔ parent</h2>
+  {convo_html}
+
+  <h2>Events</h2>
+  {filter_html}
+  {events_html}"""
+
+    return _page_shell(family, ctx["state"], ctx["missing"], "logs", content)
+
+
+def _briefings_section(
+    family_id: str, briefings: list[dict], highlight_token: str | None
+) -> str:
+    gen_form = f"""
+    <form method="post" action="/admin/{escape(family_id)}/briefing" class="briefing-gen">
+      <div>
+        <b>Generate a fresh GP briefing</b>
+        <div class="muted" style="font-size:12px;margin-top:2px">
+          Compiles the last 6 weeks of events into a one-page PDF with a QR code the GP can scan.
+        </div>
+      </div>
+      <button type="submit" class="primary">+ Generate briefing</button>
+    </form>"""
+
+    if not briefings:
+        return gen_form + '<p class="muted" style="margin-top:14px">No briefings yet.</p>'
+
+    rows = []
+    for b in briefings:
+        ts = datetime.fromtimestamp(b["mtime"]).astimezone(LOCAL_TZ).strftime("%a %d %b · %H:%M")
+        is_new = highlight_token and b["token"] == highlight_token
+        badge = ' <span class="badge">new</span>' if is_new else ""
+        rows.append(
+            f"""
+            <div class="briefing-row{' briefing-new' if is_new else ''}">
+              <div>
+                <div class="briefing-title"><b>{escape(b['token'])}</b>{badge}</div>
+                <div class="muted" style="font-size:12px">{escape(ts)} {escape(_tz_label())} · {b['size_kb']} KB</div>
+              </div>
+              <div class="briefing-actions">
+                <a href="/briefings/{escape(b['token'])}.pdf" target="_blank" class="btn-link">Open PDF</a>
+                <a href="{escape(b['url'])}" target="_blank" class="btn-link">Public URL</a>
+              </div>
+            </div>"""
+        )
+
+    return gen_form + f'<div class="briefing-list">{"".join(rows)}</div>'
+
+
+def _adherence_cards(rows: list[dict]) -> str:
+    if not rows:
+        return '<p class="muted">No active medications — add one on the Medications page.</p>'
+    cards = []
+    for r in rows:
+        m = r["medication"]
+        total = r["total"] or 1  # avoid div/zero in the bar widths
+        seg_ot = 100 * r["confirmed_on_time"] / total if r["total"] else 0
+        seg_ea = 100 * r["confirmed_early"] / total if r["total"] else 0
+        seg_la = 100 * r["confirmed_late"] / total if r["total"] else 0
+        seg_mi = 100 * r["missed"] / total if r["total"] else 0
+        bar = (
+            '<div class="ad-bar">'
+            f'<div style="width:{seg_ot:.1f}%;background:#2d7a2d" title="On time: {r["confirmed_on_time"]}"></div>'
+            f'<div style="width:{seg_ea:.1f}%;background:#5a9adf" title="Early: {r["confirmed_early"]}"></div>'
+            f'<div style="width:{seg_la:.1f}%;background:#c27d00" title="Late: {r["confirmed_late"]}"></div>'
+            f'<div style="width:{seg_mi:.1f}%;background:#a83232" title="Missed: {r["missed"]}"></div>'
+            "</div>"
+        )
+        meta = (
+            f'<span class="ad-meta"><span class="dot on"></span>{r["confirmed_on_time"]} on time</span>'
+            f'<span class="ad-meta"><span class="dot early"></span>{r["confirmed_early"]} early</span>'
+            f'<span class="ad-meta"><span class="dot late"></span>{r["confirmed_late"]} late</span>'
+            f'<span class="ad-meta"><span class="dot missed"></span>{r["missed"]} missed</span>'
+        )
+        cards.append(
+            f"""
+            <div class="ad-card">
+              <div class="ad-title">
+                <b>{escape(m['name'])}</b> <span class="muted">{escape(m.get('dose',''))}</span>
+                <span class="ad-rate">{r['rate_pct']}% confirmed</span>
+              </div>
+              {bar}
+              <div class="ad-meta-row">{meta}</div>
+            </div>"""
+        )
+    return f'<div class="ad-grid">{"".join(cards)}</div>'
+
+
+def _conversations_timeline(rows: list[dict], user_by_id: dict) -> str:
+    if not rows:
+        return '<p class="muted">No conversations yet.</p>'
+    # rows are newest-first from the repo; display as-is for a reverse-chronological feed
+    out = []
+    for r in rows:
+        ts_local = (
+            datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+            .astimezone(LOCAL_TZ)
+            .strftime("%a %H:%M:%S")
+        )
+        role = r["speaker_role"]
+        name = ""
+        if r.get("speaker_user_id"):
+            name = user_by_id.get(r["speaker_user_id"], {}).get("display_name", "")
+        speaker = escape(name) if name else escape(role)
+        css = "msg-parent" if role == "parent" else "msg-am" if role == "aunty_may" else "msg-system"
+        lang = r.get("language_code")
+        lang_badge = f'<span class="lang-badge">{escape(lang)}</span>' if lang else ""
+        out.append(
+            f"""
+            <div class="msg-row {css}">
+              <div class="msg-meta">
+                <span class="msg-ts">{escape(ts_local)}</span>
+                <span class="msg-speaker">{speaker}</span>
+                {lang_badge}
+              </div>
+              <div class="msg-body">{escape(r.get('text') or '')}</div>
+            </div>"""
+        )
+    return f'<div class="msg-list">{"".join(out)}</div>'
+
+
+def _logs_filter_bar(
+    family_id: str, current_type: str | None, days: int, seen_types: list[str]
+) -> str:
+    def opt(value: str, label: str, current) -> str:
+        sel = " selected" if str(value) == str(current) else ""
+        return f'<option value="{escape(value)}"{sel}>{escape(label)}</option>'
+
+    type_options = opt("", "All types", current_type or "") + "".join(
+        opt(t, t, current_type) for t in seen_types
+    )
+    day_options = "".join(
+        opt(str(d), f"last {d}d", days) for d in (1, 3, 7, 14, 30, 60, 90)
+    )
+    return f"""
+    <form method="get" action="/admin/{escape(family_id)}/logs" class="logs-filter">
+      <label>Type<select name="event_type">{type_options}</select></label>
+      <label>Range<select name="days">{day_options}</select></label>
+      <button type="submit">Filter</button>
+      <a href="/admin/{escape(family_id)}/logs" class="muted" style="margin-left:8px;font-size:12px">reset</a>
+    </form>"""
 
 
 def _render_medications(**ctx) -> str:

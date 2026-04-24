@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
 
 from app.bot.app import build_application
@@ -43,6 +44,11 @@ _GROUP_COMMANDS = [
 log = logging.getLogger(__name__)
 app = FastAPI(title="AI care bot")
 app.include_router(admin_router)
+
+# Serve generated briefing PDFs so the QR code on each briefing can be scanned
+# by a GP's phone through the same Cloudflare Tunnel. Public, token-in-URL access.
+from app.briefing.storage import BRIEFINGS_DIR  # noqa: E402
+app.mount("/briefings", StaticFiles(directory=str(BRIEFINGS_DIR)), name="briefings")
 
 
 @app.on_event("startup")

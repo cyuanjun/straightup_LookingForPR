@@ -46,3 +46,19 @@ async def last_n_turns(
     )
     rows = resp.data or []
     return list(reversed(rows))  # oldest → newest
+
+
+async def list_for_family(
+    family_id: UUID | str, limit: int = 200
+) -> list[dict[str, Any]]:
+    """All conversation turns for the family, newest first."""
+    client = await get_client()
+    resp = (
+        await client.table("conversations")
+        .select("*")
+        .eq("family_id", str(family_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resp.data or []

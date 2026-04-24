@@ -35,9 +35,8 @@ async def is_paused(family_id: UUID | str) -> bool:
     return bool(fam and fam.get("paused"))
 
 
-async def state(family_id: UUID | str) -> str:
-    """Returns 'active' | 'inactive_missing_fields' | 'paused' | 'not_found'."""
-    fam = await get(family_id)
+def compute_state(fam: dict | None) -> str:
+    """Pure function — no DB call. State from an already-fetched family dict."""
     if fam is None:
         return "not_found"
     if fam.get("paused"):
@@ -51,11 +50,11 @@ async def state(family_id: UUID | str) -> str:
     return "inactive_missing_fields"
 
 
-async def missing_fields(family_id: UUID | str) -> list[str]:
-    fam = await get(family_id)
+def compute_missing(fam: dict | None) -> list[str]:
+    """Pure function — no DB call."""
     if fam is None:
         return ["family_not_found"]
-    missing = []
+    missing: list[str] = []
     if not fam.get("parent_user_id"):
         missing.append("parent_handshake")
     if not fam.get("primary_caregiver_user_id"):
@@ -63,6 +62,16 @@ async def missing_fields(family_id: UUID | str) -> list[str]:
     if not fam.get("group_chat_id"):
         missing.append("group_link")
     return missing
+
+
+async def state(family_id: UUID | str) -> str:
+    """Convenience wrapper — prefers compute_state(fam) when you already have the dict."""
+    return compute_state(await get(family_id))
+
+
+async def missing_fields(family_id: UUID | str) -> list[str]:
+    """Convenience wrapper — prefers compute_missing(fam) when you already have the dict."""
+    return compute_missing(await get(family_id))
 
 
 async def set_paused(family_id: UUID | str, paused: bool) -> None:
