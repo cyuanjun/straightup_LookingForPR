@@ -14,10 +14,12 @@ from uuid import UUID
 
 from app.bot.app import build_application
 from app.bot.group_post import post_escalation
+from app.bot.med_timing import closest_slot
 from app.config import settings
+from app.db import doses as doses_repo
 from app.db import events as events_repo
 from app.db import families as families_repo
-from app.db import medications as medications_repo
+from app.db import medication as medication_repo
 from app.voice.send import send_to_parent
 
 log = logging.getLogger(__name__)
@@ -50,7 +52,7 @@ async def med_reminder_due(family_id: str, medication_id: str) -> None:
     60 minutes (e.g. they took it slightly early), suppress the reminder entirely so
     we don't nag them right after they just confirmed.
     """
-    med = await medications_repo.by_id(medication_id)
+    med = await medication_repo.by_id(medication_id)
     family = await families_repo.get(family_id)
     if not med or not family:
         return
@@ -86,14 +88,25 @@ async def med_reminder_due(family_id: str, medication_id: str) -> None:
     app = build_application()
     await send_to_parent(app.bot, parent["telegram_chat_id"], text)
 
+    now_utc = datetime.now(timezone.utc)
     reminder_event = await events_repo.insert(
         family_id,
         "med_reminder_sent",
         payload={
             "medication_id": medication_id,
-            "scheduled_time": datetime.now(timezone.utc).isoformat(),
+            "scheduled_time": now_utc.isoformat(),
         },
         medication_id=medication_id,
+    )
+
+    # Dose instance — canonical adherence state; starts as 'pending'
+    slot_time, _ = closest_slot(med["times"], datetime.now())
+    dose = await doses_repo.create_pending(
+        family_id,
+        medication_id,
+        scheduled_at=now_utc,
+        slot=slot_time.strftime("%H:%M"),
+        reminder_event_id=reminder_event["id"],
     )
 
     # Schedule window-close
@@ -106,7 +119,7 @@ async def med_reminder_due(family_id: str, medication_id: str) -> None:
         confirmation_window_close,
         "date",
         run_date=run_at,
-        args=[family_id, medication_id, reminder_event["id"]],
+        args=[family_id, medication_id, reminder_event["id"], dose["id"]],
         id=f"win_close:{reminder_event['id']}",
         replace_existing=True,
     )
@@ -114,29 +127,50 @@ async def med_reminder_due(family_id: str, medication_id: str) -> None:
 
 @requires_active_family
 async def confirmation_window_close(
-    family_id: str, medication_id: str, reminder_event_id: str
+    family_id: str,
+    medication_id: str,
+    reminder_event_id: str,
+    dose_id: str | None = None,
 ) -> None:
-    """If no med_confirmed event logged in the window, escalate to the family group."""
-    # Look back to the reminder's timestamp
+    """If no med_confirmed event logged in the window, escalate to the family group.
+
+    If a dose_instance for this reminder is still 'pending', flip it to
+    'missed_unresolved'. If it's already been confirmed, the dose is no longer pending
+    and we skip escalation.
+    """
+    # Dose-first check when we have a dose_id (new path). Fall back to event check
+    # for any in-flight window_close jobs scheduled before the dose-instance rollout.
+    if dose_id:
+        dose = await doses_repo.by_id(dose_id)
+        if not dose or dose["status"] != "pending":
+            log.info(
+                "window_close: dose %s status=%s — skip escalation",
+                dose_id,
+                dose and dose["status"],
+            )
+            return
+
     reminder = await events_repo.by_id(reminder_event_id)
     if not reminder:
         return
     reminder_ts = datetime.fromisoformat(reminder["created_at"].replace("Z", "+00:00"))
 
-    confirmed = await events_repo.had_confirmation_within_window(
-        family_id, medication_id, since=reminder_ts
-    )
-    if confirmed:
-        log.info("Confirmation present — no escalation for reminder %s", reminder_event_id)
-        return
+    if not dose_id:
+        # Legacy path: fall back to the event-based check
+        confirmed = await events_repo.had_confirmation_within_window(
+            family_id, medication_id, since=reminder_ts
+        )
+        if confirmed:
+            log.info("Confirmation present — no escalation for reminder %s", reminder_event_id)
+            return
 
-    med = await medications_repo.by_id(medication_id)
+    med = await medication_repo.by_id(medication_id)
     if not med:
         return
 
     miss_count = await events_repo.count_misses_this_week(family_id, medication_id) + 1
 
-    await events_repo.insert(
+    miss_event = await events_repo.insert(
         family_id,
         "med_missed",
         payload={
@@ -146,6 +180,8 @@ async def confirmation_window_close(
         },
         medication_id=medication_id,
     )
+    if dose_id:
+        await doses_repo.mark_missed(dose_id, miss_event_id=miss_event["id"])
 
     app = build_application()
     await post_escalation(app.bot, family_id, med, reminder_event_id, miss_count)
@@ -172,7 +208,7 @@ async def check_back_due(family_id: str, medication_id: str) -> None:
     from app.db import users as users_repo
 
     family = await families_repo.get(family_id)
-    med = await medications_repo.by_id(medication_id)
+    med = await medication_repo.by_id(medication_id)
     if not family or not med:
         return
 
@@ -212,7 +248,7 @@ async def sync_jobs_for_medication(medication_id: str) -> None:
         if job.id.startswith(prefix):
             job.remove()
 
-    med = await medications_repo.by_id(medication_id)
+    med = await medication_repo.by_id(medication_id)
     if not med or not med.get("active"):
         return
 
@@ -261,7 +297,7 @@ async def symptom_diary_due(family_id: str) -> None:
 
 async def register_all_medication_jobs() -> None:
     """Called at FastAPI startup — idempotent; re-register all active med cron jobs."""
-    meds = await medications_repo.list_all_active_across_families()
+    meds = await medication_repo.list_all_active_across_families()
     for med in meds:
         await sync_jobs_for_medication(med["id"])
 

@@ -26,7 +26,7 @@ import sys
 from app.bot.app import build_application
 from app.config import settings
 from app.db import families as families_repo
-from app.db import medications as medications_repo
+from app.db import medication as medication_repo
 from app.scheduler.jobs import med_reminder_due
 
 
@@ -56,7 +56,7 @@ async def main(fast: bool, missed: bool) -> None:
     await app.initialize()
     await app.start()
 
-    meds = await medications_repo.list_active(family_id)
+    meds = await medication_repo.list_active(family_id)
     if not meds:
         print("ERROR: no active medications for demo family", file=sys.stderr)
         sys.exit(1)

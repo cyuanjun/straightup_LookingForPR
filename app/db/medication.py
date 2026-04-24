@@ -1,4 +1,4 @@
-"""Medications repo. Fixed daily times only for MVP."""
+"""Medication repo. Fixed daily times only for MVP."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from app.db.client import get_client
 async def list_active(family_id: UUID | str) -> list[dict[str, Any]]:
     client = await get_client()
     resp = (
-        await client.table("medications")
+        await client.table("medication")
         .select("*")
         .eq("family_id", str(family_id))
         .eq("active", True)
@@ -24,7 +24,7 @@ async def list_all_active_across_families() -> list[dict[str, Any]]:
     """Used at scheduler startup to register jobs for every active med."""
     client = await get_client()
     resp = (
-        await client.table("medications")
+        await client.table("medication")
         .select("*")
         .eq("active", True)
         .execute()
@@ -35,7 +35,7 @@ async def list_all_active_across_families() -> list[dict[str, Any]]:
 async def by_id(medication_id: UUID | str) -> dict[str, Any] | None:
     client = await get_client()
     resp = (
-        await client.table("medications")
+        await client.table("medication")
         .select("*")
         .eq("id", str(medication_id))
         .maybe_single()
@@ -49,7 +49,7 @@ async def create(
 ) -> dict[str, Any]:
     client = await get_client()
     resp = (
-        await client.table("medications")
+        await client.table("medication")
         .insert(
             {
                 "family_id": str(family_id),
@@ -83,7 +83,7 @@ async def update(
         patch["active"] = active
     client = await get_client()
     resp = (
-        await client.table("medications")
+        await client.table("medication")
         .update(patch)
         .eq("id", str(medication_id))
         .execute()

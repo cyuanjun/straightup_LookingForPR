@@ -22,9 +22,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import settings
 from app.db import conversations as convo_repo
+from app.db import doses as doses_repo
 from app.db import events as events_repo
 from app.db import families as families_repo
-from app.db import medications as medications_repo
+from app.db import medication as medication_repo
 from app.db import rotation as rotation_repo
 from app.db import tokens as tokens_repo
 from app.db import users as users_repo
@@ -74,7 +75,7 @@ async def family_dashboard(family_id: str) -> HTMLResponse:
     family, all_users, meds, rotation, raw_events, on_duty_today_id = await asyncio.gather(
         families_repo.get(family_id),
         users_repo.list_all(family_id),
-        medications_repo.list_active(family_id),
+        medication_repo.list_active(family_id),
         rotation_repo.list_for_family(family_id),
         events_repo.recent_for_briefing(family_id, window_days=1),
         rotation_repo.on_duty(family_id, today_dow),
@@ -139,7 +140,7 @@ async def family_dashboard(family_id: str) -> HTMLResponse:
 async def medications_page(family_id: str) -> HTMLResponse:
     family, meds = await asyncio.gather(
         families_repo.get(family_id),
-        medications_repo.list_active(family_id),
+        medication_repo.list_active(family_id),
     )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
@@ -163,12 +164,13 @@ async def logs_page(
     # Adherence is always over 30 days — fetch in one shot if days covers it, else fetch separately.
     adherence_window = max(days, 30)
 
-    family, all_users, raw_adherence_events, conversations, meds = await asyncio.gather(
+    family, all_users, raw_adherence_events, conversations, meds, doses = await asyncio.gather(
         families_repo.get(family_id),
         users_repo.list_all(family_id),
         events_repo.recent_for_briefing(family_id, window_days=adherence_window),
         convo_repo.list_for_family(family_id, limit=200),
-        medications_repo.list_active(family_id),
+        medication_repo.list_active(family_id),
+        doses_repo.list_recent_for_family(family_id, days=30),
     )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
@@ -190,8 +192,8 @@ async def logs_page(
         reverse=True,
     )
 
-    # Adherence per active medication over last 30 days (reuses raw_adherence_events)
-    adherence = _adherence_summary(meds, raw_adherence_events, days=30)
+    # Adherence per active medication over last 30 days (from dose_instances)
+    adherence = _adherence_summary(meds, doses, days=30)
 
     # Unique event types actually seen in this window (for the filter dropdown)
     seen_types = sorted({e["type"] for e in raw_events})
@@ -218,37 +220,52 @@ async def logs_page(
     return HTMLResponse(html)
 
 
-def _adherence_summary(meds: list[dict], all_events: list[dict], days: int = 30) -> list[dict]:
-    """For each active medication, count confirmations by timing + misses over last N days.
+def _adherence_summary(meds: list[dict], doses: list[dict], days: int = 30) -> list[dict]:
+    """Count dose outcomes per medication over last N days.
 
-    Pure function — takes pre-fetched events so the caller can parallelize the fetch.
+    Reads directly from dose_instances — the lifecycle state is already resolved
+    (missed_unresolved vs missed_resolved), so adherence is just GROUP BY status.
+
+    `missed_resolved` doses count as "late" confirmations: the parent eventually took
+    the med, but only after the 15-minute window closed and the family group was
+    pinged. "On time" / "early" / "late" on a `confirmed` dose reflect the timing
+    bucket recorded at confirmation.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    by_med: dict[str, list[dict]] = {}
+    for d in doses:
+        scheduled_at = datetime.fromisoformat(d["scheduled_at"].replace("Z", "+00:00"))
+        if scheduled_at < cutoff:
+            continue
+        by_med.setdefault(d["medication_id"], []).append(d)
+
     out = []
     for m in meds:
-        mid = m["id"]
+        med_doses = by_med.get(m["id"], [])
         confirmed_on_time = 0
         confirmed_early = 0
         confirmed_late = 0
         missed = 0
-        for e in all_events:
-            if e.get("medication_id") != mid:
-                continue
-            ts = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
-            if ts < cutoff:
-                continue
-            if e["type"] == "med_confirmed":
-                timing = (e.get("payload") or {}).get("timing", "on_time")
+        pending = 0
+        for d in med_doses:
+            status = d["status"]
+            if status == "confirmed":
+                timing = d.get("timing") or "on_time"
                 if timing == "early":
                     confirmed_early += 1
                 elif timing == "late":
                     confirmed_late += 1
                 else:
                     confirmed_on_time += 1
-            elif e["type"] == "med_missed":
+            elif status == "missed_resolved":
+                # Late recovery — counts as a late confirmation, not a miss
+                confirmed_late += 1
+            elif status == "missed_unresolved":
                 missed += 1
+            elif status == "pending":
+                pending += 1  # reminder fired, no outcome yet
         total_confirmed = confirmed_on_time + confirmed_early + confirmed_late
-        total = total_confirmed + missed
+        total = total_confirmed + missed  # pending isn't a final outcome
         out.append(
             {
                 "medication": m,
@@ -342,7 +359,7 @@ async def add_medication(
         parsed_times = _parse_times(times)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    med = await medications_repo.create(family_id, name.strip(), dose.strip(), parsed_times)
+    med = await medication_repo.create(family_id, name.strip(), dose.strip(), parsed_times)
     await _sync_scheduler_for(med["id"])
     return _back_to(family_id, page="medications")
 
@@ -359,14 +376,14 @@ async def update_medication(
         parsed_times = _parse_times(times)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    await medications_repo.update(med_id, name=name.strip(), dose=dose.strip(), times=parsed_times)
+    await medication_repo.update(med_id, name=name.strip(), dose=dose.strip(), times=parsed_times)
     await _sync_scheduler_for(med_id)
     return _back_to(family_id, page="medications")
 
 
 @router.post("/{family_id}/medications/{med_id}/delete")
 async def delete_medication(family_id: str, med_id: str):
-    await medications_repo.deactivate(med_id)  # soft-delete via active=false
+    await medication_repo.deactivate(med_id)  # soft-delete via active=false
     await _sync_scheduler_for(med_id)
     return _back_to(family_id, page="medications")
 
@@ -536,6 +553,47 @@ async def generate_briefing(family_id: str):
 
     return RedirectResponse(
         f"/admin/{family_id}/logs?briefing={token}#briefings", status_code=303
+    )
+
+
+@router.post("/{family_id}/briefing/{token}/delete")
+async def delete_briefing(family_id: str, token: str):
+    """Delete a generated briefing PDF from local storage."""
+    from app.briefing import storage as storage_mod
+
+    storage_mod.delete(token)
+    return RedirectResponse(
+        f"/admin/{family_id}/logs#briefings", status_code=303
+    )
+
+
+@router.post("/{family_id}/reset-history")
+async def reset_history(family_id: str):
+    """Wipe events + conversations + dose_instances + cached briefing PDFs.
+
+    Family config (users, medication, rotation, settings, pending tokens) untouched.
+    Used to clean state between demo rehearsals.
+    """
+    from app.briefing import storage as storage_mod
+
+    if not await families_repo.get(family_id):
+        raise HTTPException(404, "Family not found")
+
+    # Briefing tokens recorded in this family's events — delete the cached PDFs first
+    # (need the events still present to read them).
+    tokens = await events_repo.briefing_tokens_for_family(family_id)
+    for tok in tokens:
+        storage_mod.delete(tok)
+
+    # Now nuke the rows.
+    await asyncio.gather(
+        events_repo.delete_all_for_family(family_id),
+        convo_repo.delete_all_for_family(family_id),
+        doses_repo.delete_all_for_family(family_id),
+    )
+
+    return RedirectResponse(
+        f"/admin/{family_id}/settings?saved=1#danger-zone", status_code=303
     )
 
 
@@ -1006,6 +1064,23 @@ def _handshake_section(family_id: str, caregivers: list[dict]) -> str:
     </form>"""
 
 
+def _danger_zone_section(family_id: str) -> str:
+    """Settings → Danger zone: reset history (events + conversations + doses + briefings)."""
+    return f"""
+    <form method="post" action="/admin/{escape(family_id)}/reset-history"
+          onsubmit="return confirm('Wipe all events, conversations, dose history, and cached briefing PDFs for this family? Config (caregivers, medication, rotation) will be kept. This cannot be undone.')"
+          class="danger-zone">
+      <div>
+        <b>Reset history</b>
+        <div class="muted" style="font-size:12px;margin-top:2px">
+          Clears every event, conversation, dose record, and cached GP briefing for this family.
+          Caregivers, medication, rotation, and onboarding tokens are kept. Useful for demo rehearsal.
+        </div>
+      </div>
+      <button type="submit" class="danger">Reset history</button>
+    </form>"""
+
+
 def _generated_banner(token: str | None, code: str | None) -> str:
     if not token and not code:
         return ""
@@ -1186,13 +1261,17 @@ _STYLES = """
   /* GP briefing */
   .briefing-gen { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; background: linear-gradient(180deg, #1a1a22 0%, #15151c 100%); border: 1px solid #24242d; border-radius: 8px; }
   .briefing-gen b { font-size: 14px; }
+  .danger-zone { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; background: linear-gradient(180deg, #1f1414 0%, #170e0e 100%); border: 1px solid #4a2222; border-radius: 8px; }
+  .danger-zone b { font-size: 14px; color: #df8a8a; }
   .briefing-list { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; }
   .briefing-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #15151c; border: 1px solid #24242d; border-radius: 6px; }
   .briefing-row.briefing-new { border-color: #2d7a2d; box-shadow: 0 0 0 1px #2d7a2d; }
   .briefing-title { font-family: "SF Mono", ui-monospace, monospace; font-size: 13px; color: #c4a3ff; }
   .briefing-actions { display: flex; gap: 8px; }
-  .btn-link { color: #5a9adf; text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid #2a4a7a; border-radius: 5px; }
+  .btn-link { color: #5a9adf; text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid #2a4a7a; border-radius: 5px; background: transparent; cursor: pointer; font-family: inherit; }
   .btn-link:hover { background: #1a2a3a; color: white; }
+  .btn-link.btn-danger { color: #df8a8a; border-color: #6a2323; }
+  .btn-link.btn-danger:hover { background: #2a1010; color: #ffd0d0; }
 
   /* Save toast */
   .toast {
@@ -1388,6 +1467,9 @@ def _briefings_section(
               <div class="briefing-actions">
                 <a href="/briefings/{escape(b['token'])}.pdf" target="_blank" class="btn-link">Open PDF</a>
                 <a href="{escape(b['url'])}" target="_blank" class="btn-link">Public URL</a>
+                <form method="post" action="/admin/{escape(family_id)}/briefing/{escape(b['token'])}/delete" onsubmit="return confirm('Delete this briefing?')" style="display:inline">
+                  <button type="submit" class="btn-link btn-danger">Delete</button>
+                </form>
               </div>
             </div>"""
         )
@@ -1520,6 +1602,9 @@ def _render_settings(**ctx) -> str:
 
   <h2>Onboarding tokens</h2>
   {_handshake_section(fam_id, caregivers)}
+
+  <h2 id="danger-zone">Danger zone</h2>
+  {_danger_zone_section(fam_id)}
 
   <script>
     (function() {{

@@ -45,6 +45,15 @@ CREATE TYPE speaker_role AS ENUM ('parent', 'aunty_may', 'system');
 CREATE TYPE token_purpose AS ENUM ('parent_handshake', 'group_linking');
 CREATE TYPE token_status  AS ENUM ('pending_confirm', 'confirmed', 'expired');
 
+-- Dose lifecycle. 'pending' = reminder fired, waiting on parent.
+--                 'confirmed' = parent confirmed within the window.
+--                 'missed_unresolved' = window closed, no confirmation.
+--                 'missed_resolved' = confirmed AFTER the miss (late recovery).
+CREATE TYPE dose_status AS ENUM (
+    'pending', 'confirmed', 'missed_unresolved', 'missed_resolved'
+);
+CREATE TYPE dose_timing AS ENUM ('on_time', 'early', 'late');
+
 --------------------------------------------------------------------------------
 -- families
 --------------------------------------------------------------------------------
@@ -91,9 +100,9 @@ ALTER TABLE families
         FOREIGN KEY (primary_caregiver_user_id) REFERENCES users(id) ON DELETE SET NULL;
 
 --------------------------------------------------------------------------------
--- medications
+-- medication
 --------------------------------------------------------------------------------
-CREATE TABLE medications (
+CREATE TABLE medication (
     id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id  uuid NOT NULL REFERENCES families(id) ON DELETE CASCADE,
     name       text NOT NULL,
@@ -102,7 +111,7 @@ CREATE TABLE medications (
     active     boolean DEFAULT true
 );
 
-CREATE INDEX medications_family_active_idx ON medications (family_id, active);
+CREATE INDEX medication_family_active_idx ON medication (family_id, active);
 
 --------------------------------------------------------------------------------
 -- rotation
@@ -123,13 +132,45 @@ CREATE TABLE events (
     type           event_type NOT NULL,
     payload        jsonb DEFAULT '{}'::jsonb,
     attributed_to  uuid REFERENCES users(id) ON DELETE SET NULL,       -- actor
-    medication_id  uuid REFERENCES medications(id) ON DELETE SET NULL,
+    medication_id  uuid REFERENCES medication(id) ON DELETE SET NULL,
     created_at     timestamptz DEFAULT now()
 );
 
 CREATE INDEX events_family_created_idx       ON events (family_id, created_at DESC);
 CREATE INDEX events_family_type_created_idx  ON events (family_id, type, created_at DESC);
 CREATE INDEX events_family_attributed_idx    ON events (family_id, attributed_to, type, created_at DESC);
+
+--------------------------------------------------------------------------------
+-- dose_instances (one row per scheduled medication slot; canonical adherence source)
+--
+-- Replaces the old pattern of pairing med_reminder_sent / med_missed / med_confirmed
+-- events to reconstruct dose outcomes. Events table stays for full audit history.
+--------------------------------------------------------------------------------
+CREATE TABLE dose_instances (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_id           uuid NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+    medication_id       uuid NOT NULL REFERENCES medication(id) ON DELETE CASCADE,
+    scheduled_at        timestamptz NOT NULL,         -- when the reminder fired
+    slot                text NOT NULL,                -- 'HH:MM' — stable across tz
+    status              dose_status NOT NULL DEFAULT 'pending',
+    timing              dose_timing,                  -- final classification
+    reminder_event_id   uuid REFERENCES events(id) ON DELETE SET NULL,
+    confirm_event_id    uuid REFERENCES events(id) ON DELETE SET NULL,
+    miss_event_id       uuid REFERENCES events(id) ON DELETE SET NULL,
+    confirmed_at        timestamptz,
+    missed_at           timestamptz,
+    created_at          timestamptz DEFAULT now(),
+    updated_at          timestamptz DEFAULT now()
+);
+
+CREATE INDEX dose_instances_family_scheduled_idx
+    ON dose_instances (family_id, scheduled_at DESC);
+CREATE INDEX dose_instances_med_status_idx
+    ON dose_instances (medication_id, status, scheduled_at DESC);
+CREATE INDEX dose_instances_family_status_idx
+    ON dose_instances (family_id, status, scheduled_at DESC);
+
+ALTER TABLE dose_instances ENABLE ROW LEVEL SECURITY;
 
 --------------------------------------------------------------------------------
 -- pending_tokens (parent handshake + group linking, single table)
@@ -220,7 +261,7 @@ CREATE TABLE setup_sessions (
 --------------------------------------------------------------------------------
 ALTER TABLE families        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE medications     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE medication      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rotation        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE events          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pending_tokens  ENABLE ROW LEVEL SECURITY;

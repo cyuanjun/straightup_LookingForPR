@@ -62,3 +62,9 @@ async def list_for_family(
         .execute()
     )
     return resp.data or []
+
+
+async def delete_all_for_family(family_id: UUID | str) -> None:
+    """Wipe every conversation turn for this family — used by Settings → Reset history."""
+    client = await get_client()
+    await client.table("conversations").delete().eq("family_id", str(family_id)).execute()

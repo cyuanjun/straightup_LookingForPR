@@ -30,9 +30,10 @@ from app.bot.group_post import post_resolution
 from app.bot.med_timing import classify_timing, closest_slot
 from app.bot.mentions import mention
 from app.config import settings
+from app.db import doses as doses_repo
 from app.db import events as events_repo
 from app.db import families as families_repo
-from app.db import medications as medications_repo
+from app.db import medication as medication_repo
 from app.db import rotation as rotation_repo
 from app.db import users as users_repo
 from app.llm import classify as classify_mod
@@ -137,7 +138,7 @@ async def _process_parent_reply(
     # Pre-match a medication name for the decide prompt (confirm_med path)
     matched_med_name: str | None = None
     if intent.get("intent") == "confirm_med":
-        meds = await medications_repo.list_active(family_id)
+        meds = await medication_repo.list_active(family_id)
         nm = intent.get("medication_name")
         matched = next(
             (m for m in meds if nm and nm.lower() in m["name"].lower()),
@@ -158,7 +159,7 @@ async def _process_parent_reply(
     kind = intent.get("intent")
     if kind == "confirm_med":
         med_name = intent.get("medication_name")
-        meds = await medications_repo.list_active(family_id)
+        meds = await medication_repo.list_active(family_id)
         matched = next(
             (m for m in meds if med_name and med_name.lower() in m["name"].lower()),
             meds[0] if meds else None,
@@ -198,7 +199,7 @@ async def _process_parent_reply(
                 )
                 return
 
-            await events_repo.insert(
+            confirm_event = await events_repo.insert(
                 family_id,
                 "med_confirmed",
                 payload={
@@ -212,6 +213,38 @@ async def _process_parent_reply(
                 },
                 medication_id=matched["id"],
             )
+
+            # Update dose_instance lifecycle (canonical adherence state).
+            #   1. Pending dose (from an active reminder) → confirm with this timing
+            #   2. Missed_unresolved dose within last 4h → resolve as late
+            #   3. Neither → standalone confirmed dose (e.g. took it before reminder fired)
+            resolution_window = timedelta(hours=4)
+            now_utc = datetime.now(timezone.utc)
+            pending = await doses_repo.find_pending_for_med(
+                family_id, matched["id"], since=now_utc - resolution_window
+            )
+            if pending:
+                await doses_repo.mark_confirmed(
+                    pending["id"], timing=timing, confirm_event_id=confirm_event["id"]
+                )
+            else:
+                unresolved = await doses_repo.find_missed_unresolved_for_med(
+                    family_id, matched["id"], since=now_utc - resolution_window
+                )
+                if unresolved:
+                    await doses_repo.resolve_miss(
+                        unresolved["id"], confirm_event_id=confirm_event["id"]
+                    )
+                else:
+                    await doses_repo.create_standalone_confirmed(
+                        family_id,
+                        matched["id"],
+                        scheduled_at=now_utc,
+                        slot=slot_str,
+                        timing=timing,
+                        confirm_event_id=confirm_event["id"],
+                    )
+
             await post_resolution(context.bot, family_id, matched, datetime.now())
 
             # Early/late → send the timing-specific warning to parent AND skip the

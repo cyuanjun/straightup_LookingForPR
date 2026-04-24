@@ -32,6 +32,18 @@ def public_url(token: str) -> str:
     return f"{public_base()}/briefings/{token}.pdf"
 
 
+def delete(token: str) -> bool:
+    """Delete the cached PDF for this token. Returns True if a file was removed."""
+    # Reject path-traversal attempts — tokens are URL-safe base64, no dots or slashes.
+    if not token or any(c in token for c in "/\\."):
+        return False
+    p = file_path(token)
+    if p.exists() and p.is_file():
+        p.unlink()
+        return True
+    return False
+
+
 def list_recent(limit: int = 10) -> list[dict]:
     """Return most recent briefings (by mtime) with token, path, url, mtime."""
     if not BRIEFINGS_DIR.exists():

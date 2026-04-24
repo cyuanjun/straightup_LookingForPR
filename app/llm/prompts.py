@@ -162,6 +162,16 @@ Sections (markdown):
   3. New-onset signals (things mentioned in last 2 weeks, not before)
   4. Family notes / questions for the GP
 
+Data sources in the JSON context:
+  - `dose_outcomes` — canonical per-dose lifecycle; trust this for adherence. Each
+    row has status ∈ {confirmed, missed_resolved, missed_unresolved, pending} and
+    timing ∈ {on_time, early, late, null}. For adherence % = (confirmed +
+    missed_resolved) / (confirmed + missed_resolved + missed_unresolved). Treat
+    `missed_resolved` as "late recovery" (took it, but only after the reminder
+    window closed + family group escalation). Ignore `pending` rows.
+  - `events` — audit trail; use for symptoms, clinical questions, distress
+    escalations, conversation context. Do NOT recount adherence from events.
+
 Clinical, compressed, 300 words max. Compile only — do not interpret.
 """
 

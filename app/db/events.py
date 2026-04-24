@@ -157,3 +157,27 @@ async def confirmations_today(
         .execute()
     )
     return resp.data or []
+
+
+async def delete_all_for_family(family_id: UUID | str) -> None:
+    """Wipe every event for this family — used by Settings → Reset history."""
+    client = await get_client()
+    await client.table("events").delete().eq("family_id", str(family_id)).execute()
+
+
+async def briefing_tokens_for_family(family_id: UUID | str) -> list[str]:
+    """Return all briefing tokens recorded in events.payload for this family."""
+    client = await get_client()
+    resp = (
+        await client.table("events")
+        .select("payload")
+        .eq("family_id", str(family_id))
+        .eq("type", "briefing_generated")
+        .execute()
+    )
+    out: list[str] = []
+    for row in resp.data or []:
+        token = (row.get("payload") or {}).get("token")
+        if token:
+            out.append(token)
+    return out
