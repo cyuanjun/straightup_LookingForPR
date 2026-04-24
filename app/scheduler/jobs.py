@@ -416,20 +416,24 @@ async def register_all_family_crons() -> None:
 
     scheduler = get_scheduler()
     client = await get_client()
-    resp = await client.table("families").select("id").execute()
+    resp = await client.table("families").select("*").execute()
     families = resp.data or []
 
     for fam in families:
         fid = fam["id"]
+
+        # Morning daily report at families.daily_report_time (default 06:00) — posts to the group
+        dr_time = fam.get("daily_report_time") or "06:00"
+        drh, drm = str(dr_time).split(":")[0:2]
         scheduler.add_job(
             daily_report,
-            CronTrigger(hour=6, minute=0),
+            CronTrigger(hour=int(drh), minute=int(drm)),
             args=[fid],
             id=f"daily_report:{fid}",
             replace_existing=True,
         )
 
-        # Evening symptom-diary check-in at families.symptom_diary_time (default 20:00)
+        # Evening symptom-diary check-in at families.symptom_diary_time (default 20:00) — parent DM
         raw_time = fam.get("symptom_diary_time") or "20:00"
         hh, mm = str(raw_time).split(":")[0:2]
         scheduler.add_job(

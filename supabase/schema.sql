@@ -55,7 +55,8 @@ CREATE TABLE families (
     primary_caregiver_user_id  uuid,                               -- FK added below
     timezone                   text        DEFAULT 'Asia/Singapore',
     languages                  text,                               -- e.g. 'zh+en'
-    symptom_diary_time         time        DEFAULT '20:00',
+    daily_report_time          time        DEFAULT '06:00',        -- morning group report
+    symptom_diary_time         time        DEFAULT '20:00',        -- evening check-in to parent DM
     paused                     boolean     DEFAULT false,
     created_at                 timestamptz DEFAULT now()
 );

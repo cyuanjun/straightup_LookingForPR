@@ -26,6 +26,7 @@ from app.db import medications as medications_repo
 from app.db import rotation as rotation_repo
 from app.db import tokens as tokens_repo
 from app.db import users as users_repo
+from app.scheduler.jobs import register_all_family_crons
 
 router = APIRouter(prefix="/admin")
 
@@ -145,7 +146,7 @@ async def medications_page(family_id: str) -> HTMLResponse:
 
 
 @router.get("/{family_id}/settings", response_class=HTMLResponse)
-async def settings_page(family_id: str) -> HTMLResponse:
+async def settings_page(family_id: str, saved: str | None = None) -> HTMLResponse:
     family = await families_repo.get(family_id)
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
@@ -165,6 +166,7 @@ async def settings_page(family_id: str) -> HTMLResponse:
         rotation=rotation,
         user_by_id=user_by_id,
         today_dow=today_dow,
+        saved=saved == "1",
     )
     return HTMLResponse(html)
 
@@ -313,6 +315,7 @@ async def update_settings(
     family_id: str,
     languages: str = Form(""),
     timezone_name: str = Form(""),
+    daily_report_time: str = Form(""),
     symptom_diary_time: str = Form(""),
 ):
     from app.db.client import get_client
@@ -322,15 +325,25 @@ async def update_settings(
         patch["languages"] = languages.strip()
     if timezone_name:
         patch["timezone"] = timezone_name.strip()
-    if symptom_diary_time:
-        # Validate HH:MM
-        parts = symptom_diary_time.split(":")
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            patch["symptom_diary_time"] = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    for key, raw in (
+        ("daily_report_time", daily_report_time),
+        ("symptom_diary_time", symptom_diary_time),
+    ):
+        if raw:
+            parts = raw.split(":")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                patch[key] = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
     if patch:
         client = await get_client()
         await client.table("families").update(patch).eq("id", family_id).execute()
-    return _back_to(family_id, "settings", page="settings")
+        # Re-register family crons so the new times take effect immediately
+        try:
+            await register_all_family_crons()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Failed to re-register family crons")
+    return RedirectResponse(f"/admin/{family_id}/settings?saved=1#settings", status_code=303)
 
 
 @router.post("/{family_id}/pause")
@@ -566,9 +579,9 @@ def _jobs_table(jobs: list) -> str:
     )
 
 
-def _time_options(selected: str = "") -> str:
+def _time_options(selected: str = "", include_blank: bool = True) -> str:
     """Generate <option> tags for 15-min intervals across 24h."""
-    opts = ['<option value="">—</option>']
+    opts = ['<option value="">—</option>'] if include_blank else []
     for h in range(24):
         for m in (0, 15, 30, 45):
             t = f"{h:02d}:{m:02d}"
@@ -777,12 +790,19 @@ def _users_section(family_id: str, users: list[dict], primary_id: str | None) ->
 
 def _settings_section(family_id: str, family: dict) -> str:
     pause_label = "Resume" if family.get("paused") else "Pause"
+    dr = str(family.get("daily_report_time") or "")[:5]   # 'HH:MM'
+    sd = str(family.get("symptom_diary_time") or "")[:5]
     return f"""
     <div id="settings" class="settings-grid">
       <form method="post" action="/admin/{escape(family_id)}/settings">
         <label>Languages <input name="languages" value="{escape(family.get('languages') or '')}" placeholder="zh+en" /></label>
         <label>Timezone <input name="timezone_name" value="{escape(family.get('timezone') or '')}" placeholder="Asia/Singapore" /></label>
-        <label>Symptom diary time <input name="symptom_diary_time" value="{escape(str(family.get('symptom_diary_time') or ''))}" placeholder="20:00" /></label>
+        <label>Daily report time (group)
+          <select name="daily_report_time">{_time_options(dr, include_blank=False)}</select>
+        </label>
+        <label>Daily check-in time (parent)
+          <select name="symptom_diary_time">{_time_options(sd, include_blank=False)}</select>
+        </label>
         <button type="submit" class="primary">Save settings</button>
       </form>
 
@@ -961,6 +981,17 @@ _STYLES = """
 
   .badge { background: #2d5ea8; color: white; font-size: 10px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
 
+  /* Save toast */
+  .toast {
+    position: fixed; top: 22px; right: 22px;
+    background: #2d7a2d; color: white; font-weight: 600; font-size: 13px;
+    padding: 10px 18px; border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+    z-index: 1000;
+  }
+  .toast-fade { opacity: 0; transform: translateY(-8px); }
+
   /* Section head with top-right action button */
   .section-head { display: flex; justify-content: flex-end; margin-bottom: 10px; }
   .btn-add { font-size: 13px; padding: 7px 14px; }
@@ -1095,7 +1126,10 @@ def _render_settings(**ctx) -> str:
     fam_id = family["id"]
     caregivers = [u for u in ctx["all_users"] if u["role"] == "caregiver"]
 
+    toast = '<div class="toast" id="save-toast">✓ Saved</div>' if ctx.get("saved") else ""
+
     content = f"""
+  {toast}
   <h2>Caregivers & parent</h2>
   {_users_section(fam_id, ctx['all_users'], family.get('primary_caregiver_user_id'))}
 
@@ -1106,6 +1140,15 @@ def _render_settings(**ctx) -> str:
   {_settings_section(fam_id, family)}
 
   <h2>Onboarding tokens</h2>
-  {_handshake_section(fam_id, caregivers)}"""
+  {_handshake_section(fam_id, caregivers)}
+
+  <script>
+    (function() {{
+      const t = document.getElementById('save-toast');
+      if (!t) return;
+      setTimeout(() => t.classList.add('toast-fade'), 2200);
+      setTimeout(() => t.remove(), 3000);
+    }})();
+  </script>"""
 
     return _page_shell(family, ctx["state"], ctx["missing"], "settings", content)
