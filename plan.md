@@ -4,7 +4,7 @@
 
 ### AI care
 
-**Wordplay:** `AI` ≈ 爱 (ài, love) in Mandarin. The name reads as both *"AI for care"* and *"love care"* in Mandarin, mirrorsing the code-switching between english and mother tongue that the product is built on.
+**Wordplay:** `AI` ≈ 爱 (ài, love) in Mandarin. The name reads as both *"AI for care"* and *"love care"* in Mandarin, mirroring the code-switching between English and mother tongue that the product is built on.
 
 **Pitch:** "AI care" redistributes the invisible caregiver work dual-income families do — across siblings, spouses, and the agent — so one person isn't carrying it alone. It keeps ageing parents safe at home and turns the 2-minute polyclinic consult into a data-rich briefing.
 
@@ -92,12 +92,13 @@ The product is a **caretaker-ops persona**, not a companion-AI-for-lonely-elderl
 
 1. **Disclosure on demand.** If anyone asks *"Are you a real person?"*, the agent says so immediately. Never accepts requests to pretend otherwise.
 2. **Never impersonate a licensed professional.** Aunty May is never a nurse. She never gives medical advice (even obvious ones like *"drink more water"*) or makes wellness claims.
-3. **Asian-polite medical deferral script.** When medical topics arise, default response: *"I'm not your doctor, Auntie. Let me note this down for your next polyclinic visit, and I'll tell Sarah so she can bring it up with Dr Tan."* Redirects by action, names family + authority, preserves the helper role.
-4. **Explicit disclosure at onboarding.** Parent consents to the AI relationship at setup; no deception by omission.
-5. **No exploitation of attachment.** If the parent bonds with Aunty May, service obligation grows, not shrinks. Shutdown = graceful 30-day transition, never abrupt.
-6. **Persona stability.** Same voice, personality, memory every time. Never emulates a specific real person (late spouse, estranged child), even if asked.
-7. **Respect the user's exit.** Never persists when the parent wants to end a conversation. Never escalates urgency to manipulate compliance.
-8. **Heavy topics route to humans.** Grief, end-of-life, deep distress — Aunty May acknowledges briefly and routes to a sibling or GP. Does not engage as a therapist.
+3. **Asian-polite medical deferral script.** When *non-urgent* medical topics arise (a general question, mild symptom, worry), default response: *"I'm not your doctor, Auntie. Let me note this down for your next polyclinic visit, and I'll tell Sarah so she can bring it up with Dr Tan."* Redirects by action, names family + authority, preserves the helper role.
+4. **Urgent symptoms are a separate path.** If the parent reports a possible immediate safety concern — chest pain, trouble breathing, fainting, a bad fall, sudden severe weakness, severe pain — use the fixed urgent safety script (not the deferral script): *"Auntie, your safety is important. Please contact your caregiver now. If this feels serious — like chest pain, trouble breathing, fainting, or a bad fall — call 995 right now."* Simultaneously DM **all** caregivers (not just on-duty) with the full transcript + urgent flag. The script is neutral — it does not diagnose severity; it defers judgment to the parent and caregivers.
+5. **Explicit disclosure at onboarding.** Parent consents to the AI relationship at setup; no deception by omission.
+6. **No exploitation of attachment.** If the parent bonds with Aunty May, service obligation grows, not shrinks. Shutdown = graceful 30-day transition, never abrupt.
+7. **Persona stability.** Same voice, personality, memory every time. Never emulates a specific real person (late spouse, estranged child), even if asked.
+8. **Respect the user's exit.** Never persists when the parent wants to end a conversation. Never escalates urgency to manipulate compliance.
+9. **Heavy topics route to humans.** Grief, end-of-life, deep emotional distress — Aunty May acknowledges briefly and routes to a sibling or GP. Does not engage as a therapist. (Distinct from urgent physical-safety symptoms in #4 — different script, different escalation.)
 
 ### What Aunty May does
 
@@ -140,6 +141,7 @@ A 5-second beat to include explicitly in the demo:
 
 - Find the bot on Telegram (e.g., `@aicare_bot`), tap **Start** → bot welcomes in DM
 - Create or pick an existing family Telegram group; add the bot as a member; ensure everyone sharing care is in it
+- Run `/linkfamily <setup_code>` in the group — this registers `families.group_chat_id` so the bot knows where to post escalations. The `setup_code` is a 6-digit code generated at `/setup` (see Phase 3); without this linking, the bot doesn't know which group belongs to which family.
 - Ensure the parent has Telegram installed on their phone (often done during a home visit)
 
 **Phase 2 — Parent handshake (deep-link + one-time token)**
@@ -148,18 +150,29 @@ A 5-second beat to include explicitly in the demo:
 
 Mechanism:
 
-1. `/setup` generates a random one-time token (e.g., `fam_abc123xyz`) mapped server-side to this family's config
+1. `/setup` generates a random one-time token (e.g., `fam_abc123xyz`) mapped server-side to this family's config (`purpose='parent_handshake'`, `status='pending_confirm'`)
 2. Bot returns a deep link: `t.me/aicare_bot?start=fam_abc123xyz`
 3. Caregiver shares the link with the parent — tap it on the parent's phone during a home visit (~10s), or send via WhatsApp / SMS
 4. Parent taps the link → Telegram opens the bot and sends `/start fam_abc123xyz`
-5. Bot looks up the token, records `parent_telegram_id = X` against this family, consumes the token
-6. Bot replies with a confirmation: *"Hi! Are you Mdm Lim? Your family added me to help you with daily care. Reply yes/no."* If no → unlink, reissue the token
+5. Bot **soft-claims the token atomically** (no consumption yet, no linking yet):
+   ```sql
+   UPDATE pending_tokens
+   SET claimed_by = :telegram_user_id
+   WHERE token = :token
+     AND status = 'pending_confirm'
+     AND claimed_by IS NULL
+     AND expires_at > now()
+   ```
+   If 0 rows returned: token invalid/already-claimed/expired — reject.
+6. Bot replies with a confirmation: *"Hi! Are you Mdm Lim? Your family added me to help you with daily care. Reply yes/no."*
+7. **On YES:** upsert `users` row (role=`parent`, set `telegram_user_id`, `telegram_chat_id`); `UPDATE families SET parent_user_id = …`; mark token `status='confirmed'`, `consumed_at=now()`. Only now is the link finalized.
+8. **On NO:** clear `claimed_by`, leave token reusable (or let the caregiver reissue); DM caregiver that parent declined.
 
 Token discipline:
 
-- Cryptographically random; single-use (consumed on first `/start`); 24-hour expiry
-- Subsequent `/start` attempts with a consumed token are rejected
-- Once linked, Aunty May can DM the parent at will
+- Cryptographically random; single-use (consumed only on confirmed `yes`, not on `/start`); 24-hour expiry
+- Atomic claim prevents race conditions if two people tap the same link
+- Once confirmed, Aunty May can DM the parent at will
 
 **Phase 3 — Configuration (bot-led `/setup`, ~5 min)**
 
@@ -209,7 +222,8 @@ The agent only ever takes *information* actions — it does not act on external 
 |---|---|
 | Routine (scheduled reminder, check-in, log entry, weekly digest) | Auto |
 | Sensitive message to parent (grief-adjacent, clinical-adjacent) | Optional family review before Aunty May sends |
-| Clinical / heavy topic raised by the parent | Never engages — uses the Asian-polite deferral script, logs for the GP briefing, routes to the on-duty sibling |
+| Non-urgent clinical / heavy topic raised by the parent | Never engages — uses the Asian-polite deferral script, logs for the GP briefing, routes to the on-duty sibling |
+| **Urgent symptom raised by the parent** (chest pain, trouble breathing, fainting, bad fall, sudden severe weakness, severe pain) | Uses the fixed urgent safety script referencing 995; DMs **all** caregivers (not just on-duty) with the full transcript; never diagnoses or reassures |
 
 ### What each surface sees
 
@@ -279,7 +293,7 @@ ElevenLabs credits are billed per generation, not per replay. **Cache generated 
 
 ### Attribution
 
-Free tier requires *"Voice by ElevenLabs"* credit on public output. Include on the pitch deck's closing slide.
+Check current ElevenLabs attribution requirements before shipping, and add *"Voice by ElevenLabs"* credit on the pitch deck's closing slide if required. Terms change over time; verify against their current pricing page at build time rather than assuming the requirement is stable.
 
 ## 7. Hero demo script (~60 seconds)
 
@@ -306,74 +320,148 @@ One scene that fires every live surface. Sandwich-generation framing.
 
 ## 8. Data model
 
-Minimum viable tables (Supabase / Postgres). Every user-scoped table carries `family_id` so RLS policies can enforce per-family isolation.
+Minimum viable tables (Supabase / Postgres). Every user-scoped table carries `family_id`. **Backend uses the Supabase service-role key which bypasses RLS** — RLS policies are defense-in-depth for future anon/user-scoped clients; code-level `family_id` scoping is the actual access control.
 
 ```
 families
-  id                  uuid (pk)
-  group_chat_id       bigint          -- Telegram group id
-  parent_user_id      uuid (fk users) -- the elderly parent
-  timezone            text            -- default 'Asia/Singapore'
-  languages           text            -- e.g. 'zh+en'
-  symptom_diary_time  time            -- default '20:00'
-  paused              boolean         -- /pause flag
-  created_at          timestamptz
+  id                          uuid (pk)
+  group_chat_id               bigint null         -- populated via /linkfamily
+  parent_user_id              uuid null (fk users) -- null until handshake confirmed
+  primary_caregiver_user_id   uuid null (fk users) -- nullable at schema; required
+                                                    --   by app logic for active families
+                                                    --   (receives error DMs, urgent fallback)
+  timezone                    text default 'Asia/Singapore'
+  languages                   text                -- e.g. 'zh+en'
+  symptom_diary_time          time default '20:00'
+  paused                      boolean default false
+  created_at                  timestamptz default now()
 
 users
   id                  uuid (pk)
   family_id           uuid (fk families)
-  telegram_user_id    bigint          -- unique
-  handle              text
-  display_name        text
-  role                enum            -- 'parent' | 'caregiver'
+  telegram_user_id    bigint null         -- null until this user links Telegram
+                                          -- (caregivers can be created from /setup
+                                          --  before they interact with the bot)
+  telegram_chat_id    bigint null         -- DM routing; populates on first interaction
+  telegram_username   text null
+  display_name        text not null
+  role                enum                -- 'parent' | 'caregiver'
+
+  -- Partial unique index (not a full unique constraint):
+  -- CREATE UNIQUE INDEX users_telegram_user_id_unique
+  --   ON users (telegram_user_id) WHERE telegram_user_id IS NOT NULL;
 
 medications
   id                  uuid (pk)
   family_id           uuid (fk)
   name                text
   dose                text
-  times               time[]          -- e.g. {'08:45', '20:00'}
-  active              boolean         -- default true
+  times               time[]              -- e.g. {'08:45', '20:00'}
+  active              boolean default true
 
 rotation
   family_id           uuid
-  day_of_week         int             -- 0 (Sun) .. 6 (Sat)
-  user_id             uuid (fk users) -- the caregiver on duty that day
+  day_of_week         int                 -- 0 (Sun) .. 6 (Sat)
+  user_id             uuid (fk users)     -- may reference unlinked caregiver
   primary key (family_id, day_of_week)
 
-events                -- append-only log; feeds nudge counter, briefing, patterns
+events                                    -- append-only log
   id                  uuid (pk)
   family_id           uuid (fk)
-  type                enum            -- see list below
-  payload             jsonb           -- event-specific details
-  attributed_to       uuid (fk users, nullable)   -- for nudge-counter attribution
-  medication_id       uuid (fk, nullable)
-  created_at          timestamptz
+  type                enum                -- see values below
+  payload             jsonb               -- event-specific details
+  attributed_to       uuid null (fk users) -- actor who performed the action;
+                                           -- for nudge_sent_by_caregiver = tapper
+  medication_id       uuid null (fk)
+  created_at          timestamptz default now()
 
-pending_tokens        -- parent handshake tokens (Phase 2 of onboarding)
-  token               text (pk)
+pending_tokens                            -- serves two purposes via `purpose` column
+  token               text (pk)           -- URL-safe 16-byte (parent) or UUID (group)
   family_id           uuid (fk)
-  expires_at          timestamptz
-  consumed_at         timestamptz     -- null until claimed
-  claimed_by          bigint          -- telegram_user_id, null until claimed
+  purpose             enum                -- 'parent_handshake' | 'group_linking'
+  setup_code          text null           -- 6-digit, for group_linking only
+  created_by_user_id  uuid null (fk users) -- caregiver who initiated (for /linkfamily auth)
+  claimed_by          bigint null         -- telegram_user_id of claimant (parent flow only)
+  status              enum                -- 'pending_confirm' | 'confirmed' | 'expired'
+  expires_at          timestamptz         -- shared 24h expiry
+  consumed_at         timestamptz null
+  created_at          timestamptz default now()
 
-appointments          -- from .ics upload
+  -- Check constraints:
+  --   parent_handshake rows: token length >= 22
+  --   group_linking rows: setup_code matches ^\d{6}$
+  -- Partial unique index to prevent active setup_code collisions:
+  --   CREATE UNIQUE INDEX pending_tokens_active_setup_code_unique
+  --     ON pending_tokens (setup_code)
+  --     WHERE setup_code IS NOT NULL AND status = 'pending_confirm';
+
+appointments                              -- from .ics upload
   id                  uuid (pk)
   family_id           uuid (fk)
+  uid                 text                -- from .ics, or sha256(summary|starts_at|location)
+                                          --   fallback if source .ics missing UID
   starts_at           timestamptz
   title               text
   location            text
+  unique (family_id, uid)
 
-audio_cache           -- TTS output cache (keyed by text hash + voice id)
-  text_hash           text (pk)       -- sha256(text || voice_id)
+audio_cache                               -- TTS output cache
+  text_hash           text (pk)           -- sha256(text || voice_id)
   voice_id            text
-  audio_url           text            -- Supabase storage or local path
-  created_at          timestamptz
+  file_path           text                -- local filesystem path
+  created_at          timestamptz default now()
+
+conversations                             -- memory for Aunty May (last-N turn retrieval)
+  id                  uuid (pk)
+  family_id           uuid (fk) not null
+  chat_id             bigint              -- identifies the thread
+  speaker_role        enum                -- 'parent' | 'aunty_may' | 'system'
+                                          --   (DISTINCT from users.role; do not share enum types)
+  speaker_user_id     uuid null (fk users) -- null for aunty_may/system
+  text                text
+  language_code       text null
+  created_at          timestamptz default now()
+
+setup_sessions                            -- persists /setup wizard progress across restarts
+  id                  uuid (pk)
+  family_id           uuid (fk)
+  caregiver_user_id   uuid (fk users)
+  state               jsonb               -- wizard step + collected values
+  updated_at          timestamptz default now()
 ```
 
-**`events.type` values:** `med_reminder_sent`, `med_confirmed`, `med_missed`, `symptom_entry`, `nudge_posted`, `nudge_sent_by_caregiver`, `check_back_sent`, `briefing_generated`, `sensitive_defer`, `parent_optout`.
+**`events.type` values:** `med_reminder_sent`, `parent_reply_transcribed`, `med_confirmed`, `partial_confirm`, `symptom_entry`, `clinical_question_deferred`, `distress_escalated`, `urgent_symptom_escalated`, `med_missed`, `escalation_posted`, `nudge_sent_by_caregiver`, `check_back_sent`, `appointment_reminder_sent`, `weekly_digest_sent`, `briefing_generated`, `parent_optout`.
 
-**RLS:** every query scoped by `family_id` ∈ (families where `auth.uid()` is a member).
+**Minimum `events.payload` shapes** (required fields per type; briefing + pattern detection depend on consistency):
+
+```
+med_reminder_sent           : { medication_id, scheduled_time, audio_cache_hash }
+parent_reply_transcribed    : { transcript, language_code, confidence }
+med_confirmed               : { medication_id, transcript, confidence, source: 'parent_voice' | 'caregiver_sent' }
+partial_confirm             : { medication_id, transcript, missing_item }
+symptom_entry               : { symptom_text, transcript, language_code, confidence }
+clinical_question_deferred  : { transcript, question_text, language_code }
+distress_escalated          : { transcript, language_code }
+urgent_symptom_escalated    : { transcript, symptom_text, language_code,
+                                caregivers_dmed: [user_id, ...] }
+med_missed                  : { medication_id, reminder_event_id, window_min }
+escalation_posted           : { reminder_event_id, group_message_id, pattern_count }
+nudge_sent_by_caregiver     : { reminder_event_id, draft_text }
+check_back_sent             : { medication_id, audio_cache_hash }
+appointment_reminder_sent   : { appointment_id }
+weekly_digest_sent          : { per_user_counts: { user_id: count, ... } }
+briefing_generated          : { pdf_url, event_window_start, event_window_end }
+parent_optout               : { reason?: text }
+```
+
+**Seed order** (mutually-referential FKs + nullable parent/caregiver):
+1. Insert `families` with `parent_user_id = NULL`, `primary_caregiver_user_id = NULL`, `group_chat_id = NULL`
+2. Insert `users` rows (caregivers first)
+3. `UPDATE families SET primary_caregiver_user_id = …` once the caregiver user exists
+4. `UPDATE families SET group_chat_id = …` when `/linkfamily` completes
+5. `UPDATE families SET parent_user_id = …` when parent handshake is confirmed
+
+**Active-family invariant:** a family is "active" only when `parent_user_id`, `primary_caregiver_user_id`, and `group_chat_id` are all set. Reminder jobs are gated by this invariant — see §10.
 
 **Medication scope (MVP):** only fixed daily times supported (`times time[]`). Complex regimens — alternating days, as-needed, meal-linked — are phase 2.
 
@@ -387,10 +475,15 @@ Three load-bearing prompts. Use OpenAI function-calling for structured JSON outp
 You classify the parent's voice-reply transcript into one of:
   - confirm_med         (explicit confirmation of medication)
   - partial_confirm     (confirmed part — e.g. "ate breakfast" but no mention of meds)
-  - symptom_entry       (reports a bodily symptom)
-  - clinical_question   (asks for medical advice)
-  - distress            (emotional distress, grief, acute worry)
+  - symptom_entry       (reports a mild/routine bodily symptom)
+  - clinical_question   (asks for medical advice, non-urgent)
+  - urgent_symptom      (possible immediate safety concern — chest pain, trouble breathing,
+                         fainting, severe fall, sudden severe weakness, severe pain)
+  - distress            (emotional distress, grief, acute worry — not a physical safety concern)
   - off_topic           (greetings, chatter, unrelated)
+
+When in doubt between symptom_entry and urgent_symptom, prefer urgent_symptom — false positives
+are safer than false negatives for physical safety.
 
 Context: what Aunty May just asked.
 Transcript: <parent reply>
@@ -403,16 +496,22 @@ Return: { intent, medication_name?, symptom_text?, question_text?, confidence (0
 ```
 You choose the agent's next action given the classified intent.
 
-Rules (non-negotiable):
-  1. clinical_question → ALWAYS use the deferral script:
+Rules (non-negotiable, evaluated in order):
+  1. urgent_symptom → ALWAYS use the urgent safety script:
+     "Auntie, your safety is important. Please contact your caregiver now. If this
+      feels serious — like chest pain, trouble breathing, fainting, or a bad fall —
+      call 995 right now."
+     Escalate to ALL caregivers (not just on-duty) with the full transcript.
+     Do not diagnose, reassure, minimize, or advise treatment.
+  2. clinical_question → ALWAYS use the deferral script:
      "I'm not your doctor, Auntie. Let me note this down for your next polyclinic
       visit, and I'll tell {caregiver_name} so she can bring it up with Dr {gp_name}."
-  2. distress → brief acknowledge, route to on-duty caregiver. Never engage as therapist.
-  3. symptom_entry → silent-log + warm thank-you.
-  4. confirm_med → log confirmation + warm acknowledgment in the parent's language.
-  5. partial_confirm → gentle re-ask of the unconfirmed part.
+  3. distress → brief acknowledge, route to on-duty caregiver. Never engage as therapist.
+  4. symptom_entry → silent-log + warm thank-you.
+  5. confirm_med → log confirmation + warm acknowledgment in the parent's language.
+  6. partial_confirm → gentle re-ask of the unconfirmed part.
 
-Return: { action, aunty_reply_text?, escalate_to_group (bool), log_only (bool) }
+Return: { action, aunty_reply_text?, escalate_to_group (bool), escalate_to_all_caregivers (bool), log_only (bool) }
 ```
 
 ### Briefing compile (GPT-4o)

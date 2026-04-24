@@ -4,70 +4,74 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-This repo is **design-only** at the moment — no code, no build system, no tests. The single substantive file is [second-shift.md](second-shift.md), a detailed product + architecture spec for a 5-day hackathon build (submission Fri 25 Apr 12:00, pitch 13:00). Before making non-trivial changes or starting implementation, read that document — it is the source of truth for scope, persona, and architecture decisions.
+The repo is **design-only** — no code, no build system, no tests. The source of truth is [plan.md](plan.md), a 12-section build plan for a 5-day hackathon. Before making non-trivial changes or starting implementation, read `plan.md` end-to-end — it has the product, architecture, data model, prompts, scheduler, bot commands, and scope decisions.
 
-When the first code lands, extend this file with the actual build / test / lint commands for whatever stack gets wired up first. Do not invent commands before they exist.
+[archive/second-shift.md](archive/second-shift.md) is the *original* spec we iterated from. It has pitch-strategy content (judge alignment, risks, market context, roadmap, pitch deck outline) that didn't port to `plan.md` but remains useful for pitch prep. It is **stale on feature-level content** — do not treat it as authoritative for the build.
+
+When the first code lands, extend this file with the actual build / test / lint commands. Do not invent commands before they exist.
 
 ## Product in one line
 
-"Second Shift" — an agentic caregiver-ops product for the SG sandwich generation. **The user is the adult child and their siblings, not the elderly parent.** Every feature decision flows from that reframe. See [second-shift.md](second-shift.md#the-product).
+**"AI care"** — an agentic caregiver-ops product for the SG sandwich generation. **The user is the adult child and their siblings, not the elderly parent.** Every feature decision flows from that reframe.
 
-## Architecture (planned)
+The name plays on the Mandarin homophone `AI` ≈ 爱 (ài, love) — reads as both *"AI for care"* and *"love care"* to a Mandarin ear; mirrors the code-switching the product is built on.
 
-Four user-facing surfaces, one agent backbone. Not four separate products — all share ingest → classify → pattern-reason → plan → act → log. See the pipeline diagram at [second-shift.md](second-shift.md#ai-architecture-the-57-step-pipeline).
+## Architecture
 
-- **Aunty May voice persona** — the parent-facing surface. Telegram voice messages only (not text, not phone calls). Mandarin + English for MVP; Hokkien/Malay/Tamil are phase-2.
-- **Family group** — Telegram group chat with siblings + spouse. Agent posts events, @-mentions the on-duty person, drafts nudges in the sender's voice. No separate persona — plain-text ops.
-- **GP briefing** — structured PDF generated from the last 6 weeks of adherence + symptom data; shared only at polyclinic visits.
-- **Receipts feed** — signed (ed25519 or C2PA) ledger of every action the agent took. Siblings can audit.
+Three surfaces, one agent backbone:
 
-### Planned tech stack
+- **Parent surface — Aunty May** (voice persona). Telegram voice messages only. Mandarin + English for MVP.
+- **Family group surface** — shared Telegram group with siblings + spouse. Agent auto-posts events, @-mentions the on-duty person, attaches canned nudge templates + inline buttons. No persona — plain ops.
+- **GP output** — one-page briefing PDF + QR, generated before each polyclinic visit. An artifact, not a feed.
+
+### Pipeline (see [plan.md §5](plan.md))
+
+Multimodal ingest → STT → Classify + extract → Pattern detection → Decide + plan → Act (voice reply / group post / briefing compile).
+
+All reasoning happens on **text**. Voice is the user-facing I/O boundary — ElevenLabs wraps around the OpenAI text LLM at both ends. The LLM never sees or generates audio directly.
+
+### Tech stack (see [plan.md §6](plan.md))
 
 | Layer | Choice |
 |---|---|
 | Backend | Python + FastAPI |
-| Dialogue LLM | GPT-5 (primary), GPT-4o-mini (routing/classification) |
-| STT | MERaLiON-AudioLLM (primary, SG-tuned), Whisper-large-v3 (fallback) |
-| TTS | ElevenLabs Multilingual v2 |
-| Messaging | Telegram Bot API (`sendVoice` + voice handler) — **not** WhatsApp (provisioning > 1 week) |
+| LLM | OpenAI GPT-4o (dialogue / decide / briefing) + GPT-4o-mini (classify / fast paths) |
+| STT + TTS | ElevenLabs — Scribe (STT) + Multilingual v2 (TTS), single vendor |
+| Messaging | Telegram Bot API (`sendVoice` out, `voice` handler in) |
 | DB | Supabase (Postgres + RLS) |
-| Frontend | Next.js + Tailwind (family-group view only; parent view is inside Telegram) |
-| Tool use | OpenAI function calling + MCP for external integrations |
+| Scheduling | APScheduler with SQLAlchemy job store (Postgres-backed) |
+| Frontend | None — all UX lives in Telegram |
+| Auth | Telegram user IDs + Supabase RLS scoped by `family_id` |
 
-Full rationale for each pick: [second-shift.md](second-shift.md#tech-stack-choices-for-a-5-day-build).
+### Integration reality
 
-### Integration reality (important for scoping work)
+- **Actually wired in MVP:** Telegram bot (both surfaces), end-to-end Aunty May voice loop, on-duty rotation, nudge counter + weekly digest, GP briefing PDF generation, `.ics` upload + appointment reminders
+- **Explicitly out of MVP scope (don't reintroduce):** bill payment execution, appointment booking via API, signed receipts feed (E2), MERaLiON STT, Next.js frontend, MCP servers, separate auth layer (Clerk/Supabase Auth)
 
-Per the spec, only these are **actually wired** in the MVP:
-
-- Telegram bot (both surfaces — parent voice exchange and family group)
-- Signed receipts feed
-- End-to-end Aunty May voice loop (Telegram voice in → MERaLiON → GPT-5 → ElevenLabs → Telegram voice out)
-
-These are **mocked with real UI**: polyclinic appointment booking, bill ingestion from email/SMS, bill payment flow.
-
-These are **slide-only**: deeper polyclinic integration, insurance, banking APIs, fleet management.
-
-Don't build real integrations for the slide-only items. Don't mock the live demo moment (the voice loop).
+Out-of-scope items were cut after scope + API-constraint analysis — not oversights.
 
 ## Non-obvious constraints that must shape any code
 
-These come straight from the spec's guardrails section and will be probed by the judging panel. Any implementation that violates them is a bug, not a stylistic preference.
+These are the guardrails in [plan.md §3](plan.md). Violating them is a bug, not a style preference.
 
-1. **Clinical line is hard.** The product tracks *confirmations*, never *compliance*. It surfaces patterns, never interprets them. Aunty May never gives medical advice — not even "drink more water." When medical topics arise, the scripted response is: *"I'm not your doctor, Auntie. Let me note this down for your next polyclinic visit, and I'll tell Sarah so she can bring it up with Dr Tan."* The agent logs + pings the on-duty sibling; it does **not** call the doctor.
+1. **Clinical line is hard.** Track *confirmations*, never *compliance*. Surface patterns, never interpret them. Aunty May never gives medical advice — not even *"drink more water"* or wellness claims. When medical topics arise, default response is the Asian-polite deferral script: *"I'm not your doctor, Auntie. Let me note this down for your next polyclinic visit, and I'll tell {caregiver_name} so she can bring it up with Dr {gp_name}."* Agent logs + pings on-duty sibling; never calls the doctor.
 
-2. **Disclosure on demand, no impersonation.** If anyone asks "Are you a real person?", the agent must say so immediately. Never accept requests to pretend otherwise. Never emulate a specific real person (e.g., a late spouse).
+2. **Disclosure on demand, no impersonation.** If anyone asks *"Are you a real person?"*, agent says so immediately. Never pretend otherwise. Never emulate a specific real person (late spouse, estranged child).
 
-3. **Blast-radius-gated autonomy.** Low (routine log/reminder) → auto-act. Medium (message to parent, payment < S$200) → draft for family approval. High (large payment, medical decision) → no action without explicit group approval. Clinical → never acts, always routes. See the table at [second-shift.md](second-shift.md#escalation-thresholds).
+3. **Agent behaviour by action type** (see [plan.md §4](plan.md)):
+   - Routine (reminders, logs, digests) → auto-act
+   - Sensitive messages (clinical- or grief-adjacent) → optional family review before send
+   - Clinical / heavy topics raised by parent → never engage; deferral script + log + @-ping on-duty sibling
+   - Agent **never** acts on external systems (no payments, no bookings) — only information actions
 
-4. **Surface visibility is not symmetric.** Mdm Lim sees only her private Aunty May thread; her voice replies stay private. The family group sees only outcomes/summaries, not Mdm Lim's actual voice content. The GP sees only the briefing PDF. Don't leak content across surfaces in any code path.
+4. **Surface visibility is asymmetric.** Parent sees only her private Aunty May voice thread; her voice replies stay private. Family group sees events + outcomes, not parent's voice content. GP sees only the briefing PDF at the visit. Never leak content across surfaces.
 
-5. **Persona is for the parent only.** Aunty May (warm, named, voice). Family group = plain ops, first-name basis, no persona. GP briefing = clinical/compressed. Don't add a persona to surfaces that don't have one.
+5. **Persona is for the parent only.** Aunty May (warm, named, voice) in the parent DM. Family group = first-name basis, no persona, templated posts. GP briefing = clinical/compressed. Don't add a persona to surfaces that don't have one.
 
-6. **MVP language scope is Mandarin + English only.** Don't scaffold Hokkien/Malay/Tamil in the 5-day window — they're phase-2 roadmap.
+6. **MVP language scope is Mandarin + English only.** Don't scaffold Hokkien / Malay / Tamil — phase-2 roadmap.
+
+7. **Transparency over advocacy.** The product is built gender-neutral. The "caregiver load disproportionately falls on women" reality is named by the *data the product generates*, not by the product's branding or copy. Don't bake gendered language into UI or prompts.
 
 ## Scope discipline
 
-The spec is emphatic that the demo is **one 60-second scene** showing all four surfaces firing for one family (see [hero demo script](second-shift.md#hero-demo-script-60-seconds)). When asked to add a feature, check whether it serves that scene. If not, it belongs on the roadmap slide, not in the build.
-
-Specifically **out of MVP scope** (removed deliberately, don't reintroduce): polypharmacy / drug-interaction logic, CPF / CareShield / MediSave integrations, multi-parent families, predictive clinical signals, hired-caregiver marketplace handoff.
+The demo is **one 60-second scene** (see [plan.md §7](plan.md)): morning-med voice reminder → confirmation miss → on-duty @-mention with drafted nudge → handoff via ✓ Sent tap → Aunty May check-back → resolution → flash to Friday weekly digest showing the nudge-counter disparity. When asked to add a feature, check whether it serves that scene. If not, it belongs on the roadmap slide.
