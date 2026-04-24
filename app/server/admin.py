@@ -566,59 +566,143 @@ def _jobs_table(jobs: list) -> str:
     )
 
 
-def _meds_section(family_id: str, meds: list[dict]) -> str:
-    """Inline-editable medications grid. Each row is always editable; Save + Delete per row."""
-    hidden_forms: list[str] = []
-    rows: list[str] = []
+def _time_options(selected: str = "") -> str:
+    """Generate <option> tags for 15-min intervals across 24h."""
+    opts = ['<option value="">—</option>']
+    for h in range(24):
+        for m in (0, 15, 30, 45):
+            t = f"{h:02d}:{m:02d}"
+            sel = " selected" if t == selected else ""
+            opts.append(f'<option value="{t}"{sel}>{t}</option>')
+    return "".join(opts)
 
+
+def _time_row_html(selected: str = "") -> str:
+    return (
+        '<div class="time-row">'
+        f'<select class="time-select">{_time_options(selected)}</select>'
+        '<button type="button" class="btn-icon" onclick="removeTime(this)" title="Remove">×</button>'
+        '</div>'
+    )
+
+
+def _med_dialog(
+    dialog_id: str,
+    title: str,
+    form_action: str,
+    name: str = "",
+    dose: str = "",
+    times: list[str] | None = None,
+) -> str:
+    """Render a <dialog> with the add/edit form inside."""
+    tlist = times or []
+    if tlist:
+        time_rows = "".join(_time_row_html(t) for t in tlist)
+    else:
+        time_rows = _time_row_html()
+    return f"""
+    <dialog id="{escape(dialog_id)}" class="med-dialog">
+      <form method="post" action="{escape(form_action)}" onsubmit="return syncTimes(this)">
+        <h3>{escape(title)}</h3>
+        <label>Name<input name="name" value="{escape(name)}" placeholder="Lisinopril" required autocomplete="off" /></label>
+        <label>Dose<input name="dose" value="{escape(dose)}" placeholder="10mg" required autocomplete="off" /></label>
+        <label>Times
+          <div class="time-rows">{time_rows}</div>
+          <button type="button" class="btn-small" onclick="addTime(this)">+ Add time</button>
+        </label>
+        <input type="hidden" name="times" />
+        <div class="dialog-actions">
+          <button type="button" onclick="this.closest('dialog').close()">Cancel</button>
+          <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+    </dialog>"""
+
+
+_MED_DIALOG_JS = """
+<script>
+  function addTime(btn) {
+    const rows = btn.previousElementSibling;
+    const first = rows.firstElementChild.cloneNode(true);
+    first.querySelector('select').value = '';
+    rows.appendChild(first);
+  }
+  function removeTime(btn) {
+    const row = btn.parentElement;
+    const container = row.parentElement;
+    if (container.children.length > 1) row.remove();
+    else btn.closest('.time-row').querySelector('select').value = '';
+  }
+  function syncTimes(form) {
+    const selects = form.querySelectorAll('.time-select');
+    const values = [...selects].map(s => s.value).filter(v => v);
+    if (values.length === 0) { alert('Add at least one time.'); return false; }
+    form.querySelector('input[name="times"]').value = values.join(',');
+    return true;
+  }
+</script>"""
+
+
+def _meds_section(family_id: str, meds: list[dict]) -> str:
+    """Table view of medications + top-right [+ Add] button that opens a modal."""
+    # Rows
+    rows: list[str] = []
+    edit_dialogs: list[str] = []
     for m in meds:
         mid = m["id"]
-        times_str = ", ".join(str(t)[:5] for t in (m.get("times") or []))
-        # Hidden companion forms that the inputs + buttons below reference via form=""
-        hidden_forms.append(
-            f'<form id="edit-{escape(mid)}" method="post" '
-            f'action="/admin/{escape(family_id)}/medications/{escape(mid)}/update" '
-            f'style="display:none"></form>'
-            f'<form id="del-{escape(mid)}" method="post" '
-            f'action="/admin/{escape(family_id)}/medications/{escape(mid)}/delete" '
-            f'style="display:none" '
-            f"onsubmit=\"return confirm('Delete {escape(m['name'])}?');\"></form>"
-        )
+        times_list = [str(t)[:5] for t in (m.get("times") or [])]
+        times_str = ", ".join(times_list) or "—"
         rows.append(f"""
-          <div class="meds-row">
-            <input form="edit-{escape(mid)}" name="name" value="{escape(m['name'])}" required />
-            <input form="edit-{escape(mid)}" name="dose" value="{escape(m.get('dose', ''))}" required />
-            <input form="edit-{escape(mid)}" name="times" value="{escape(times_str)}" placeholder="08:45, 20:00" required />
-            <div class="meds-row-actions">
-              <button form="edit-{escape(mid)}" type="submit" class="primary">Save</button>
-              <button form="del-{escape(mid)}" type="submit" class="danger">Delete</button>
-            </div>
-          </div>""")
-
-    if not meds:
-        rows.append(
-            '<div class="meds-empty muted">No active medications yet. Add one below.</div>'
+          <tr>
+            <td><b>{escape(m['name'])}</b></td>
+            <td>{escape(m.get('dose', ''))}</td>
+            <td class="nowrap">{escape(times_str)}</td>
+            <td class="meds-actions">
+              <button type="button" onclick="document.getElementById('dialog-edit-{escape(mid)}').showModal()">Edit</button>
+              <form method="post"
+                    action="/admin/{escape(family_id)}/medications/{escape(mid)}/delete"
+                    onsubmit="return confirm('Delete {escape(m['name'])}?');"
+                    style="display:inline">
+                <button type="submit" class="danger">Delete</button>
+              </form>
+            </td>
+          </tr>""")
+        edit_dialogs.append(
+            _med_dialog(
+                dialog_id=f"dialog-edit-{mid}",
+                title="Edit medication",
+                form_action=f"/admin/{family_id}/medications/{mid}/update",
+                name=m["name"],
+                dose=m.get("dose", ""),
+                times=times_list,
+            )
         )
 
-    add_form = f"""
-        <form method="post" action="/admin/{escape(family_id)}/medications" class="meds-row meds-add">
-          <input name="name" placeholder="Lisinopril" required />
-          <input name="dose" placeholder="10mg" required />
-          <input name="times" placeholder="08:45, 20:00" required />
-          <div class="meds-row-actions">
-            <button type="submit" class="primary">+ Add</button>
-          </div>
-        </form>"""
+    body = (
+        "".join(rows)
+        if meds
+        else '<tr><td colspan="4" class="muted" style="text-align:center;padding:28px;font-style:italic">No medications yet. Click <b>+ Add medication</b> to create one.</td></tr>'
+    )
+
+    add_dialog = _med_dialog(
+        dialog_id="dialog-add",
+        title="Add medication",
+        form_action=f"/admin/{family_id}/medications",
+    )
 
     return f"""
-    {''.join(hidden_forms)}
-    <div class="meds-grid">
-      <div class="meds-header">
-        <div>Name</div><div>Dose</div><div>Times</div><div></div>
-      </div>
-      {''.join(rows)}
-      {add_form}
-    </div>"""
+    <div class="section-head">
+      <button type="button" class="primary btn-add" onclick="document.getElementById('dialog-add').showModal()">+ Add medication</button>
+    </div>
+    <table class="meds-table">
+      <thead>
+        <tr><th style="width:30%">Name</th><th style="width:15%">Dose</th><th>Times</th><th style="width:1%"></th></tr>
+      </thead>
+      <tbody>{body}</tbody>
+    </table>
+    {add_dialog}
+    {''.join(edit_dialogs)}
+    {_MED_DIALOG_JS}"""
 
 
 def _rotation_section(
@@ -877,17 +961,49 @@ _STYLES = """
 
   .badge { background: #2d5ea8; color: white; font-size: 10px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
 
-  /* Medications — inline editable grid */
-  .meds-grid { display: flex; flex-direction: column; background: #15151c; border-radius: 8px; overflow: hidden; border: 1px solid #24242d; }
-  .meds-header, .meds-row { display: grid; grid-template-columns: 2fr 1fr 2fr auto; gap: 12px; padding: 10px 14px; align-items: center; border-bottom: 1px solid #24242d; }
-  .meds-header { background: #1a1a22; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #888; font-weight: 600; }
-  .meds-row:last-of-type { border-bottom: none; }
-  .meds-row input { background: #1a1a22; color: #e4e4ea; border: 1px solid #2a2a34; padding: 7px 10px; border-radius: 5px; font-size: 13px; width: 100%; }
-  .meds-row input:focus { outline: none; border-color: #3d6eb8; background: #1d1d28; }
-  .meds-row-actions { display: flex; gap: 6px; justify-content: flex-end; }
-  .meds-add { background: #121219; border-top: 1px dashed #2a2a34; }
-  .meds-add input { background: #1a1a22; }
-  .meds-empty { padding: 24px; text-align: center; font-style: italic; }
+  /* Section head with top-right action button */
+  .section-head { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+  .btn-add { font-size: 13px; padding: 7px 14px; }
+
+  /* Medications table */
+  .meds-table { table-layout: fixed; }
+  .meds-table td.nowrap { color: #c4a3ff; font-family: "SF Mono", ui-monospace, monospace; font-size: 12px; }
+  .meds-actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
+  .meds-actions form { margin: 0; display: inline; }
+
+  /* Modal dialog */
+  dialog.med-dialog {
+    background: #15151c; color: #e4e4ea;
+    border: 1px solid #2a2a34; border-radius: 10px;
+    padding: 22px 24px; min-width: 400px; max-width: 540px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  }
+  dialog.med-dialog::backdrop { background: rgba(5,5,10,0.72); backdrop-filter: blur(2px); }
+  dialog.med-dialog h3 { margin: 0 0 16px; font-size: 16px; font-weight: 700; color: #fafafa; }
+  dialog.med-dialog form { display: flex; flex-direction: column; gap: 14px; }
+  dialog.med-dialog label {
+    display: flex; flex-direction: column; gap: 6px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #888; font-weight: 600;
+  }
+  dialog.med-dialog label input, dialog.med-dialog label select {
+    background: #1a1a22; color: #e4e4ea; border: 1px solid #2a2a34;
+    padding: 8px 10px; border-radius: 5px; font-size: 14px; text-transform: none;
+  }
+  dialog.med-dialog label input:focus { outline: none; border-color: #3d6eb8; }
+
+  .time-rows { display: flex; flex-direction: column; gap: 6px; }
+  .time-row { display: flex; gap: 6px; align-items: center; }
+  .time-row select {
+    flex: 1; background: #1a1a22; color: #e4e4ea; border: 1px solid #2a2a34;
+    padding: 7px 10px; border-radius: 5px; font-size: 13px;
+  }
+  .btn-icon { padding: 4px 10px; font-size: 14px; line-height: 1; }
+  .btn-small { align-self: flex-start; font-size: 12px; padding: 4px 10px; margin-top: 4px; }
+
+  .dialog-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    margin-top: 4px; padding-top: 14px; border-top: 1px solid #24242d;
+  }
 
   select { background: #1a1a22; color: #e4e4ea; border: 1px solid #2a2a34; border-radius: 5px; padding: 6px 10px; font-size: 13px; }
 
