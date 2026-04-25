@@ -63,7 +63,7 @@ Makes the invisible caregiver labor visible and routable.
 
 ### Appointment manager *(A4, D3)*
 
-- Family uploads HealthHub's `.ics` export directly to the bot in Telegram; bot parses and stores appointments locally
+- Family uploads HealthHub's `.ics` export via the admin dashboard (Settings → Appointments); the parser stores appointments locally and surfaces them in the weekly Monday group update
 - Day-before reminders: voice to parent, text to family group
 - Re-upload `.ics` when appointments change
 - *(Phase 2: auto-sync via public Google Calendar `.ics` URL; transport coordination)*
@@ -182,7 +182,7 @@ In DM with the primary caregiver, the bot walks through:
 - **Medications** — for each: name, dose, times (multiple supported)
 - **Symptom-diary check-in time** — default 20:00
 - **On-duty rotation** — bot auto-lists family group members; caregiver maps them to days of the week
-- **HealthHub `.ics` upload** — caregiver exports from HealthHub, forwards the file to the bot in DM; bot parses and stores appointments locally
+- **HealthHub `.ics` upload** — caregiver exports from HealthHub, drops the file into the admin dashboard's Settings → Appointments uploader; the parser de-dupes by UID + surfaces upcoming appointments in the weekly Monday update
 - **Group visibility** — defaults shared; individual opt-in for private surfaces
 
 Caregiver reviews the config summary and `/confirm`.
@@ -332,7 +332,12 @@ families
                                                     --   (receives error DMs, urgent fallback)
   timezone                    text default 'Asia/Singapore'
   languages                   text                -- e.g. 'zh+en'
-  symptom_diary_time          time default '20:00'
+  daily_report_time           time default '06:00' -- weekly Monday-morning group
+                                                     -- report time. Column kept for
+                                                     -- backward compat after the
+                                                     -- daily→weekly rename; UI label
+                                                     -- reads "Weekly report time".
+  symptom_diary_time          time default '20:00' -- evening DM check-in to parent
   paused                      boolean default false
   created_at                  timestamptz default now()
 
@@ -358,6 +363,27 @@ medication
   dose                text
   times               time[]              -- e.g. {'08:45', '20:00'}
   active              boolean default true
+
+dose_instances                            -- canonical adherence state
+  -- One row per scheduled medication slot. Lifecycle:
+  --   pending → confirmed | missed_unresolved → missed_resolved
+  -- Adherence reads doses, NOT paired events — this is what fixed the
+  -- "missed once, took it after, double-counted" bug.
+  id                  uuid (pk)
+  family_id           uuid (fk families)
+  medication_id       uuid (fk medication)
+  scheduled_at        timestamptz         -- when reminder fired
+  slot                text                -- 'HH:MM' — stable across tz
+  status              enum                -- 'pending' | 'confirmed'
+                                          --  | 'missed_unresolved' | 'missed_resolved'
+  timing              enum null           -- 'on_time' | 'early' | 'late'
+  reminder_event_id   uuid null (fk events)
+  confirm_event_id    uuid null (fk events)
+  miss_event_id       uuid null (fk events)
+  confirmed_at        timestamptz null
+  missed_at           timestamptz null
+  created_at          timestamptz default now()
+  updated_at          timestamptz default now()
 
 rotation
   family_id           uuid
@@ -546,31 +572,34 @@ Jobs persist to the DB, survive restarts, and can be added/removed from a functi
 | Job | Trigger | Payload |
 |---|---|---|
 | `med_reminder_due` | cron per med × time slot | `(family_id, medication_id)` |
-| `confirmation_window_close` | date (+15 min from reminder) | `(family_id, medication_id, reminder_id)` |
-| `check_back_due` | date (+20 min from escalation) | `(family_id, medication_id)` |
+| `confirmation_window_close` | date (+15 min from reminder) | `(family_id, medication_id, reminder_id, dose_id)` |
+| `check_back_due` | date (+12 min from escalation) | `(family_id, medication_id)` |
 | `symptom_diary_due` | cron daily at `symptom_diary_time` | `(family_id)` |
+| `weekly_report` | cron Mon at `daily_report_time` (default 06:00) | `(family_id)` |
 | `weekly_digest` | cron Friday 18:00 | `(family_id)` |
-| `appointment_reminder_due` | date (day-before at 18:00) | `(family_id, appointment_id)` |
+| `appointment_reminder_due` *(planned, not built)* | date (day-before at 18:00) | `(family_id, appointment_id)` |
 
-### Appointment ingest (`.ics` → scheduled reminders)
+### Appointment ingest (`.ics` → appointments table → weekly report)
 
-When a caregiver uploads a `.ics` file to the bot in DM:
+When a caregiver uploads a `.ics` file via the **Settings → Appointments** section of the admin dashboard:
 
-1. **Parse** — use Python's `icalendar` (RFC 5545 compliant) or `ics` library
-2. **Extract per event:**
-   - `DTSTART` → `appointments.starts_at` (timezone-aware; HealthHub exports in `Asia/Singapore`)
+1. **Parse** — `app/bot/ics_ingest.py` uses Python's `icalendar` library; UTF-8 with Windows-1252 fallback
+2. **Extract per VEVENT:**
+   - `DTSTART` → `appointments.starts_at` (timezone-aware; missing TZ → assume `Asia/Singapore`)
    - `SUMMARY` → `appointments.title`
    - `LOCATION` → `appointments.location`
-   - `UID` → store for de-dup on re-upload
-3. **Filter** — ignore events with `starts_at` in the past
-4. **De-dup** — match on `UID`: update existing rows if changed, insert new ones
-5. **Schedule** — for each upcoming appointment, register an `appointment_reminder_due` job at `starts_at − 1 day − at 18:00 local`
-6. **Confirm to caregiver** — bot replies: *"Found 3 upcoming appointments: 28 Apr (Dr Tan), 15 May (Dr Ng), 2 Jun. Day-before reminders added."*
+   - `UID` → store for de-dup; if missing, fall back to `sha256(title|starts_at|location)`
+3. **Filter** — past events are skipped
+4. **De-dup** — upsert on `(family_id, uid)`
+5. **Surface** — appointments show up in the Settings appointments list immediately AND in the next Monday weekly group report (next-14-days window)
+
+**Not yet built:** standalone `appointment_reminder_due` cron jobs (one-shot day-before reminders). Currently the weekly Monday update is the only surfaced reminder.
 
 **Error handling:**
-- Malformed `.ics` → friendly error DM, don't crash
-- Re-upload of same `.ics` → idempotent (no-op after de-dup)
-- Timezone missing on an event → assume `Asia/Singapore`
+- Malformed `.ics` → 400 with parse-error detail, no DB writes
+- Re-upload of same `.ics` → idempotent (PostgREST upsert with `family_id,uid` conflict key)
+- All-day events → `DTSTART` is a `date`, anchored at midnight local
+- Recurring (`RRULE`) → master event date only; expansion not yet wired
 
 **Fallback (simpler if APScheduler hits friction):** a one-minute tick from systemd timer or a cron job that queries the DB for all "due-now" events. Less elegant, zero job-state to manage.
 

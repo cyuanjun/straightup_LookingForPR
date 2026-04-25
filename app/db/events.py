@@ -107,6 +107,46 @@ async def recent_for_briefing(
     return resp.data or []
 
 
+async def recent_for_display(
+    family_id: UUID | str,
+    window_days: int = 7,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """First N events (newest first) within the window — for the Logs page timeline."""
+    client = await get_client()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    resp = (
+        await client.table("events")
+        .select("*")
+        .eq("family_id", str(family_id))
+        .gte("created_at", cutoff.isoformat())
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resp.data or []
+
+
+async def count_for_display(
+    family_id: UUID | str,
+    window_days: int = 7,
+    event_type: str | None = None,
+) -> int:
+    """Total events in the window — for "showing N of M" labels."""
+    client = await get_client()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    q = (
+        client.table("events")
+        .select("id", count="exact")
+        .eq("family_id", str(family_id))
+        .gte("created_at", cutoff.isoformat())
+    )
+    if event_type:
+        q = q.eq("type", event_type)
+    resp = await q.execute()
+    return resp.count or 0
+
+
 async def by_id(event_id: UUID | str) -> dict[str, Any] | None:
     client = await get_client()
     resp = (

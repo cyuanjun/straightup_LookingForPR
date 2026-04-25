@@ -64,6 +64,18 @@ async def list_for_family(
     return resp.data or []
 
 
+async def count_for_family(family_id: UUID | str) -> int:
+    """Total conversation turn count — for "showing N of M" labels."""
+    client = await get_client()
+    resp = (
+        await client.table("conversations")
+        .select("id", count="exact")
+        .eq("family_id", str(family_id))
+        .execute()
+    )
+    return resp.count or 0
+
+
 async def delete_all_for_family(family_id: UUID | str) -> None:
     """Wipe every conversation turn for this family — used by Settings → Reset history."""
     client = await get_client()

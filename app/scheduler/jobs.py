@@ -7,6 +7,7 @@ internally.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from datetime import datetime, timedelta, timezone
@@ -86,7 +87,15 @@ async def med_reminder_due(family_id: str, medication_id: str) -> None:
         text = f"Good morning Auntie, have you had your breakfast and {med['name']}?"
 
     app = build_application()
-    await send_to_parent(app.bot, parent["telegram_chat_id"], text)
+    languages = family.get("languages") or "zh+en"
+    lang_code = "zh" if "zh" in languages else "en"
+    await send_to_parent(
+        app.bot,
+        parent["telegram_chat_id"],
+        text,
+        family_id=family_id,
+        language_code=lang_code,
+    )
 
     now_utc = datetime.now(timezone.utc)
     reminder_event = await events_repo.insert(
@@ -115,7 +124,8 @@ async def med_reminder_due(family_id: str, medication_id: str) -> None:
 
     scheduler = get_scheduler()
     run_at = datetime.now(timezone.utc) + timedelta(minutes=window_min)
-    scheduler.add_job(
+    await asyncio.to_thread(
+        scheduler.add_job,
         confirmation_window_close,
         "date",
         run_date=run_at,
@@ -192,7 +202,8 @@ async def confirmation_window_close(
 
     scheduler = get_scheduler()
     run_at = datetime.now(timezone.utc) + timedelta(minutes=offset_min)
-    scheduler.add_job(
+    await asyncio.to_thread(
+        scheduler.add_job,
         check_back_due,
         "date",
         run_date=run_at,
@@ -223,7 +234,14 @@ async def check_back_due(family_id: str, medication_id: str) -> None:
         text = f"Auntie, have you taken your {med['name']}?"
 
     app = build_application()
-    await send_to_parent(app.bot, parent["telegram_chat_id"], text)
+    lang_code = "zh" if "zh" in languages else "en"
+    await send_to_parent(
+        app.bot,
+        parent["telegram_chat_id"],
+        text,
+        family_id=family_id,
+        language_code=lang_code,
+    )
 
     await events_repo.insert(
         family_id,
@@ -237,6 +255,8 @@ async def sync_jobs_for_medication(medication_id: str) -> None:
     """After add / edit / deactivate, re-register cron jobs for a medication.
 
     Removes any existing med_reminder:{medication_id}:* jobs, then (if active) adds fresh ones.
+    APScheduler's SQLAlchemyJobStore is sync — wrap each store-touching call in
+    `asyncio.to_thread` so we don't freeze the event loop during startup.
     """
     from app.scheduler.scheduler import get_scheduler
 
@@ -244,9 +264,10 @@ async def sync_jobs_for_medication(medication_id: str) -> None:
     prefix = f"med_reminder:{medication_id}:"
 
     # Remove stale
-    for job in list(scheduler.get_jobs()):
+    all_jobs = await asyncio.to_thread(scheduler.get_jobs)
+    for job in all_jobs:
         if job.id.startswith(prefix):
-            job.remove()
+            await asyncio.to_thread(job.remove)
 
     med = await medication_repo.by_id(medication_id)
     if not med or not med.get("active"):
@@ -257,9 +278,11 @@ async def sync_jobs_for_medication(medication_id: str) -> None:
     for time_str in med["times"] or []:
         # time_str may be 'HH:MM:SS' or 'HH:MM' — normalize
         hh, mm = time_str.split(":")[0:2]
-        scheduler.add_job(
+        trigger = CronTrigger(hour=int(hh), minute=int(mm))
+        await asyncio.to_thread(
+            scheduler.add_job,
             med_reminder_due,
-            CronTrigger(hour=int(hh), minute=int(mm)),
+            trigger,
             args=[med["family_id"], medication_id],
             id=f"{prefix}{hh}{mm}",
             replace_existing=True,
@@ -290,7 +313,14 @@ async def symptom_diary_due(family_id: str) -> None:
         text = "Auntie Lim, how are you feeling today?"
 
     app = build_application()
-    await send_to_parent(app.bot, parent["telegram_chat_id"], text)
+    lang_code = "zh" if "zh" in languages else "en"
+    await send_to_parent(
+        app.bot,
+        parent["telegram_chat_id"],
+        text,
+        family_id=family_id,
+        language_code=lang_code,
+    )
     # No event logged here — a parent reply will create the symptom_entry or
     # parent_reply_transcribed event through the voice handler.
 
@@ -302,20 +332,43 @@ async def register_all_medication_jobs() -> None:
         await sync_jobs_for_medication(med["id"])
 
 
+async def sync_jobs_for_family(family_id: str) -> None:
+    """Drop every medication cron for this family + re-register from current DB state.
+
+    Called by Settings → Reset history so a wipe leaves no stale jobs pointing at
+    deleted med ids, and any meds added during the reset transaction get fresh
+    cron registrations.
+    """
+    from app.scheduler.scheduler import get_scheduler
+
+    scheduler = get_scheduler()
+    all_jobs = await asyncio.to_thread(scheduler.get_jobs)
+    for job in all_jobs:
+        if not job.id.startswith("med_reminder:"):
+            continue
+        # job.args = [family_id, medication_id]
+        if (job.args or [None])[0] == family_id:
+            await asyncio.to_thread(job.remove)
+
+    meds = await medication_repo.list_active(family_id)
+    for med in meds:
+        await sync_jobs_for_medication(med["id"])
+
+
 # ---------------------------------------------------------------------------
-# Daily morning report (06:00 local) + weekly digest (Fri 18:00 local)
+# Weekly Monday update (group) + weekly digest (Fri 18:00 local)
 # ---------------------------------------------------------------------------
 
 
 @requires_active_family
-async def daily_report(family_id: str) -> None:
-    """06:00 morning post to the family group.
+async def weekly_report(family_id: str) -> None:
+    """Monday-morning post to the family group setting up the week ahead.
 
     Contents:
-      - Today's on-duty caregiver (mentioned)
-      - Yesterday's adherence snapshot (confirmed / missed counts)
-      - Upcoming appointments in the next 7 days
-      - Any urgent flags in the last 24h
+      - On-duty rotation for the week
+      - Last 7 days' adherence snapshot (confirmed / missed counts)
+      - Upcoming appointments in the next 14 days (from .ics ingest)
+      - Any urgent flags in the last 7 days
     """
     from html import escape
     from zoneinfo import ZoneInfo
@@ -333,40 +386,36 @@ async def daily_report(family_id: str) -> None:
         return
 
     now_local = datetime.now(tz)
-    today_dow = (now_local.weekday() + 1) % 7
 
-    # Today's on-duty
-    on_duty_id = await rotation_repo.on_duty(family_id, today_dow)
-    on_duty = await users_repo.by_id(on_duty_id) if on_duty_id else None
+    # Rotation for the week — Mon..Sun
+    rotation_rows = await rotation_repo.list_for_family(family_id)
+    by_dow = {r["day_of_week"]: r["user_id"] for r in rotation_rows}
+    rotation_user_ids = list({uid for uid in by_dow.values() if uid})
+    rotation_users: dict[str, dict] = {}
+    for uid in rotation_user_ids:
+        u = await users_repo.by_id(uid)
+        if u:
+            rotation_users[uid] = u
 
-    # Yesterday's events (local-day window)
-    yesterday_start_local = (now_local - timedelta(days=1)).replace(
+    # Past 7-day events
+    week_start_local = (now_local - timedelta(days=7)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start_utc = yesterday_start_local.astimezone(timezone.utc)
+    week_start_utc = week_start_local.astimezone(timezone.utc)
 
-    all_events = await events_repo.recent_for_briefing(family_id, window_days=2)
-    yesterday_events = [
+    all_events = await events_repo.recent_for_briefing(family_id, window_days=8)
+    week_events = [
         e
         for e in all_events
-        if yesterday_start_utc
-        <= datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
-        < today_start_local.astimezone(timezone.utc)
+        if datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) >= week_start_utc
     ]
-    confirmed = sum(1 for e in yesterday_events if e["type"] == "med_confirmed")
-    missed = sum(1 for e in yesterday_events if e["type"] == "med_missed")
-    urgent_24h = sum(
-        1
-        for e in all_events
-        if e["type"] == "urgent_symptom_escalated"
-        and (datetime.now(timezone.utc) - datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))).total_seconds()
-        < 24 * 60 * 60
-    )
+    confirmed = sum(1 for e in week_events if e["type"] == "med_confirmed")
+    missed = sum(1 for e in week_events if e["type"] == "med_missed")
+    urgent_7d = sum(1 for e in week_events if e["type"] == "urgent_symptom_escalated")
 
-    # Upcoming appointments (next 7 days)
-    upcoming = await appt_repo.list_upcoming(family_id, limit=10)
-    cutoff = now_local + timedelta(days=7)
+    # Upcoming appointments (next 14 days)
+    upcoming = await appt_repo.list_upcoming(family_id, limit=20)
+    cutoff = now_local + timedelta(days=14)
     nearby = [
         a
         for a in upcoming
@@ -374,28 +423,41 @@ async def daily_report(family_id: str) -> None:
     ]
 
     # Compose HTML
-    lines = [f"🌅 <b>Good morning — {now_local.strftime('%A %d %b')}</b>", ""]
+    lines = [
+        f"📅 <b>Week ahead — {now_local.strftime('%a %d %b')}</b>",
+        "",
+    ]
 
-    if on_duty:
+    # Rotation
+    if rotation_users:
+        lines.append("📍 <b>This week's rotation</b>")
+        day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        for dow in [1, 2, 3, 4, 5, 6, 0]:  # display Mon-first
+            uid = by_dow.get(dow)
+            if uid and (u := rotation_users.get(uid)):
+                lines.append(
+                    f"  • {day_names[dow]}: {mention(u['display_name'], u.get('telegram_user_id'))}"
+                )
+            else:
+                lines.append(f"  • {day_names[dow]}: <i>unassigned</i>")
+    else:
+        lines.append("📍 <i>No rotation set — assign in the admin dashboard</i>")
+
+    # Last 7 days' adherence
+    lines.append("")
+    if confirmed or missed:
+        total = confirmed + missed
+        pct = round(100 * confirmed / total) if total else 0
         lines.append(
-            f"📍 On duty today: {mention(on_duty['display_name'], on_duty.get('telegram_user_id'))}"
+            f"💊 Last 7 days: {confirmed}/{total} doses confirmed ({pct}%)"
         )
     else:
-        lines.append("📍 <i>Nobody on duty today — assign in the admin dashboard</i>")
-
-    # Yesterday's adherence
-    if confirmed or missed:
-        bar = "✓" * confirmed + "✗" * missed
-        lines.append("")
-        lines.append(f"💊 Yesterday: {confirmed} confirmed, {missed} missed  <code>{bar}</code>")
-    else:
-        lines.append("")
-        lines.append("💊 No medication activity logged yesterday.")
+        lines.append("💊 No medication activity logged in the past 7 days.")
 
     # Upcoming appointments
     if nearby:
         lines.append("")
-        lines.append("🗓 <b>Upcoming (next 7 days):</b>")
+        lines.append("🗓 <b>Upcoming (next 14 days):</b>")
         for a in nearby:
             starts = datetime.fromisoformat(a["starts_at"].replace("Z", "+00:00")).astimezone(tz)
             label = starts.strftime("%a %d %b %H:%M")
@@ -403,11 +465,14 @@ async def daily_report(family_id: str) -> None:
             loc = a.get("location")
             loc_str = f" @ {escape(loc)}" if loc else ""
             lines.append(f"  • <b>{label}</b> — {title}{loc_str}")
+    else:
+        lines.append("")
+        lines.append("🗓 <i>No appointments in the next 14 days.</i>")
 
-    if urgent_24h:
+    if urgent_7d:
         lines.append("")
         lines.append(
-            f"🚨 <b>{urgent_24h} urgent-symptom flag{'s' if urgent_24h != 1 else ''} in the last 24h</b> — please follow up."
+            f"🚨 <b>{urgent_7d} urgent-symptom flag{'s' if urgent_7d != 1 else ''} this past week</b> — please follow up."
         )
 
     msg = "\n".join(lines)
@@ -455,24 +520,33 @@ async def register_all_family_crons() -> None:
     resp = await client.table("families").select("*").execute()
     families = resp.data or []
 
+    # Clean up stale `daily_report:*` jobs from before the rename (one-time migration)
+    existing = await asyncio.to_thread(scheduler.get_jobs)
+    for job in existing:
+        if job.id.startswith("daily_report:"):
+            await asyncio.to_thread(job.remove)
+
     for fam in families:
         fid = fam["id"]
 
-        # Morning daily report at families.daily_report_time (default 06:00) — posts to the group
+        # Weekly Monday report at families.daily_report_time (default 06:00) — posts to the group.
+        # Column name kept for backward compat; UI label says "Weekly report time".
         dr_time = fam.get("daily_report_time") or "06:00"
         drh, drm = str(dr_time).split(":")[0:2]
-        scheduler.add_job(
-            daily_report,
-            CronTrigger(hour=int(drh), minute=int(drm)),
+        await asyncio.to_thread(
+            scheduler.add_job,
+            weekly_report,
+            CronTrigger(day_of_week="mon", hour=int(drh), minute=int(drm)),
             args=[fid],
-            id=f"daily_report:{fid}",
+            id=f"weekly_report:{fid}",
             replace_existing=True,
         )
 
         # Evening symptom-diary check-in at families.symptom_diary_time (default 20:00) — parent DM
         raw_time = fam.get("symptom_diary_time") or "20:00"
         hh, mm = str(raw_time).split(":")[0:2]
-        scheduler.add_job(
+        await asyncio.to_thread(
+            scheduler.add_job,
             symptom_diary_due,
             CronTrigger(hour=int(hh), minute=int(mm)),
             args=[fid],
@@ -480,7 +554,8 @@ async def register_all_family_crons() -> None:
             replace_existing=True,
         )
 
-        scheduler.add_job(
+        await asyncio.to_thread(
+            scheduler.add_job,
             weekly_digest,
             CronTrigger(day_of_week="fri", hour=18, minute=0),
             args=[fid],

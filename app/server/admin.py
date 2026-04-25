@@ -17,10 +17,11 @@ from datetime import datetime, time, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import settings
+from app.db import appointments as appt_repo
 from app.db import conversations as convo_repo
 from app.db import doses as doses_repo
 from app.db import events as events_repo
@@ -88,8 +89,10 @@ async def family_dashboard(family_id: str) -> HTMLResponse:
 
     from app.scheduler.scheduler import get_scheduler
 
+    # APScheduler 3.x SQLAlchemyJobStore is sync — wrap in to_thread so it doesn't
+    # block the asyncio loop (which would freeze every concurrent request).
     try:
-        all_jobs = get_scheduler().get_jobs()
+        all_jobs = await asyncio.to_thread(get_scheduler().get_jobs)
     except Exception:
         all_jobs = []
     family_jobs = [j for j in all_jobs if (j.args or [None])[0] == family_id]
@@ -158,19 +161,24 @@ async def logs_page(
     event_type: str | None = None,
     days: int = 7,
     briefing: str | None = None,
+    events_n: int = 10,
+    convos_n: int = 10,
 ) -> HTMLResponse:
-    # Clamp days to a sane range
+    # Clamp days + display caps to sane ranges
     days = max(1, min(days, 90))
-    # Adherence is always over 30 days — fetch in one shot if days covers it, else fetch separately.
-    adherence_window = max(days, 30)
+    events_n = max(10, min(events_n, 1000))
+    convos_n = max(10, min(convos_n, 1000))
 
-    family, all_users, raw_adherence_events, conversations, meds, doses = await asyncio.gather(
+    # Adherence still spans 30 days; events for display fetched separately so the
+    # main page payload stays small even when the underlying tables are huge.
+    family, all_users, displayed_events_raw, conversations, meds, doses, all_30d_events = await asyncio.gather(
         families_repo.get(family_id),
         users_repo.list_all(family_id),
-        events_repo.recent_for_briefing(family_id, window_days=adherence_window),
-        convo_repo.list_for_family(family_id, limit=200),
+        events_repo.recent_for_display(family_id, window_days=days, limit=events_n),
+        convo_repo.list_for_family(family_id, limit=convos_n),
         medication_repo.list_active(family_id),
         doses_repo.list_recent_for_family(family_id, days=30),
+        events_repo.recent_for_briefing(family_id, window_days=30),
     )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
@@ -179,24 +187,29 @@ async def logs_page(
     state = families_repo.compute_state(family)
     missing = families_repo.compute_missing(family) if state == "inactive_missing_fields" else []
 
-    # Events (filtered by the user-selected `days` window, a subset of raw_adherence_events)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    raw_events = [
-        e
-        for e in raw_adherence_events
-        if datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) >= cutoff
+    # Filter the displayed events client-side by event_type; the page-of-N is already
+    # newest-first from the repo.
+    events = [
+        e for e in displayed_events_raw
+        if (not event_type or e["type"] == event_type)
     ]
-    events = sorted(
-        [e for e in raw_events if (not event_type or e["type"] == event_type)],
-        key=lambda e: e["created_at"],
-        reverse=True,
-    )
 
     # Adherence per active medication over last 30 days (from dose_instances)
     adherence = _adherence_summary(meds, doses, days=30)
 
-    # Unique event types actually seen in this window (for the filter dropdown)
-    seen_types = sorted({e["type"] for e in raw_events})
+    # Unique event types seen in the days-window (for the filter dropdown) — derived
+    # from the 30-day pull so the dropdown is stable across pagination.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    seen_types = sorted({
+        e["type"] for e in all_30d_events
+        if datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) >= cutoff
+    })
+
+    # Total counts for the "showing N of M" labels + show-more visibility
+    events_total = await events_repo.count_for_display(
+        family_id, window_days=days, event_type=event_type
+    )
+    convos_total = await convo_repo.count_for_family(family_id)
 
     # Briefings — recent files from cache, with the just-generated token (if any) highlighted
     from app.briefing import storage as briefing_storage
@@ -216,6 +229,10 @@ async def logs_page(
         seen_types=seen_types,
         briefings=briefings,
         highlight_briefing_token=briefing,
+        events_n=events_n,
+        events_total=events_total,
+        convos_n=convos_n,
+        convos_total=convos_total,
     )
     return HTMLResponse(html)
 
@@ -281,11 +298,16 @@ def _adherence_summary(meds: list[dict], doses: list[dict], days: int = 30) -> l
 
 
 @router.get("/{family_id}/settings", response_class=HTMLResponse)
-async def settings_page(family_id: str, saved: str | None = None) -> HTMLResponse:
-    family, all_users, rotation = await asyncio.gather(
+async def settings_page(
+    family_id: str,
+    saved: str | None = None,
+    ics_added: int | None = None,
+) -> HTMLResponse:
+    family, all_users, rotation, appointments = await asyncio.gather(
         families_repo.get(family_id),
         users_repo.list_all(family_id),
         rotation_repo.list_for_family(family_id),
+        appt_repo.list_upcoming(family_id, limit=50),
     )
     if not family:
         raise HTTPException(404, f"Family {family_id} not found")
@@ -304,6 +326,8 @@ async def settings_page(family_id: str, saved: str | None = None) -> HTMLRespons
         user_by_id=user_by_id,
         today_dow=today_dow,
         saved=saved == "1",
+        appointments=appointments,
+        ics_added=ics_added,
     )
     return HTMLResponse(html)
 
@@ -569,12 +593,14 @@ async def delete_briefing(family_id: str, token: str):
 
 @router.post("/{family_id}/reset-history")
 async def reset_history(family_id: str):
-    """Wipe events + conversations + dose_instances + cached briefing PDFs.
+    """Wipe events + conversations + dose_instances + cached briefing PDFs,
+    and re-sync the medication cron jobs against current DB state.
 
     Family config (users, medication, rotation, settings, pending tokens) untouched.
     Used to clean state between demo rehearsals.
     """
     from app.briefing import storage as storage_mod
+    from app.scheduler.jobs import sync_jobs_for_family
 
     if not await families_repo.get(family_id):
         raise HTTPException(404, "Family not found")
@@ -592,8 +618,59 @@ async def reset_history(family_id: str):
         doses_repo.delete_all_for_family(family_id),
     )
 
+    # Sync medication crons — drops orphans + re-registers active meds. Cheap;
+    # makes Reset a guaranteed clean slate.
+    await sync_jobs_for_family(family_id)
+
     return RedirectResponse(
         f"/admin/{family_id}/settings?saved=1#danger-zone", status_code=303
+    )
+
+
+@router.post("/{family_id}/upload-ics")
+async def upload_ics(family_id: str, ics_file: UploadFile = File(...)):
+    """Parse uploaded .ics + upsert appointments via (family_id, uid)."""
+    from app.bot.ics_ingest import parse_ics
+
+    if not await families_repo.get(family_id):
+        raise HTTPException(404, "Family not found")
+
+    raw = await ics_file.read()
+    if not raw:
+        raise HTTPException(400, "Empty file")
+
+    try:
+        events = parse_ics(raw)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not parse .ics file: {exc}")
+
+    added = 0
+    for ev in events:
+        await appt_repo.upsert(
+            family_id,
+            ev["uid"],
+            ev["starts_at"],
+            ev["title"],
+            ev["location"],
+        )
+        added += 1
+
+    return RedirectResponse(
+        f"/admin/{family_id}/settings?saved=1&ics_added={added}#appointments",
+        status_code=303,
+    )
+
+
+@router.post("/{family_id}/appointment/{appointment_id}/delete")
+async def delete_appointment(family_id: str, appointment_id: str):
+    from app.db.client import get_client
+
+    client = await get_client()
+    await client.table("appointments").delete().eq("id", appointment_id).eq(
+        "family_id", family_id
+    ).execute()
+    return RedirectResponse(
+        f"/admin/{family_id}/settings#appointments", status_code=303
     )
 
 
@@ -679,8 +756,10 @@ def _job_label(job_id: str) -> str:
     """Human label for the hero banner + grouped scheduled-jobs section."""
     if job_id.startswith("med_reminder:"):
         return "Medication reminder"
+    if job_id.startswith("weekly_report:"):
+        return "Weekly report"
     if job_id.startswith("daily_report:"):
-        return "Daily report"
+        return "Daily report"  # legacy — cleaned up at startup
     if job_id.startswith("symptom_diary:"):
         return "Daily check-in"
     if job_id.startswith("weekly_digest:"):
@@ -697,7 +776,7 @@ def _job_label(job_id: str) -> str:
 # Preferred display order for grouped scheduled-jobs table
 _JOB_GROUP_ORDER = [
     "Medication reminder",
-    "Daily report",
+    "Weekly report",
     "Daily check-in",
     "Weekly digest",
     "Appointment reminder",
@@ -1019,16 +1098,34 @@ def _users_section(family_id: str, users: list[dict], primary_id: str | None) ->
     </form>"""
 
 
+_LANGUAGE_OPTIONS = [
+    ("zh+en", "Mandarin + English (mixed, default)"),
+    ("zh", "Mandarin only (中文)"),
+    ("en", "English only"),
+]
+
+
+def _language_options_html(selected: str) -> str:
+    parts = []
+    for value, label in _LANGUAGE_OPTIONS:
+        sel = " selected" if selected == value else ""
+        parts.append(f'<option value="{escape(value)}"{sel}>{escape(label)}</option>')
+    return "".join(parts)
+
+
 def _settings_section(family_id: str, family: dict) -> str:
     pause_label = "Resume" if family.get("paused") else "Pause"
     dr = str(family.get("daily_report_time") or "")[:5]   # 'HH:MM'
     sd = str(family.get("symptom_diary_time") or "")[:5]
+    lang = family.get("languages") or "zh+en"
     return f"""
     <div id="settings" class="settings-grid">
       <form method="post" action="/admin/{escape(family_id)}/settings">
-        <label>Languages <input name="languages" value="{escape(family.get('languages') or '')}" placeholder="zh+en" /></label>
+        <label>Language for Aunty May
+          <select name="languages">{_language_options_html(lang)}</select>
+        </label>
         <label>Timezone <input name="timezone_name" value="{escape(family.get('timezone') or '')}" placeholder="Asia/Singapore" /></label>
-        <label>Daily report time (group)
+        <label>Weekly report time (every Monday, group)
           <select name="daily_report_time">{_time_options(dr, include_blank=False)}</select>
         </label>
         <label>Daily check-in time (parent)
@@ -1046,6 +1143,63 @@ def _settings_section(family_id: str, family: dict) -> str:
         <button type="submit" class="{'danger' if family.get('paused') else 'primary'}">{pause_label} reminders</button>
       </form>
     </div>"""
+
+
+def _appointments_section(
+    family_id: str, appointments: list[dict], ics_added: int | None
+) -> str:
+    upload_form = f"""
+    <form method="post" action="/admin/{escape(family_id)}/upload-ics" enctype="multipart/form-data" class="briefing-gen">
+      <div>
+        <b>Upload .ics calendar file</b>
+        <div class="muted" style="font-size:12px;margin-top:2px">
+          Polyclinic / specialist appointments. Each event is upserted by UID, so re-uploading the same file is idempotent. Past events are skipped.
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="file" name="ics_file" accept=".ics" required />
+        <button type="submit" class="primary">Upload</button>
+      </div>
+    </form>"""
+
+    banner = ""
+    if ics_added is not None:
+        if ics_added > 0:
+            banner = f'<div class="banner">✓ Added / updated {ics_added} appointment{"s" if ics_added != 1 else ""}.</div>'
+        else:
+            banner = '<div class="banner">No future appointments found in that file.</div>'
+
+    if not appointments:
+        body = '<p class="muted" style="margin-top:14px">No appointments yet — upload an .ics file to add some.</p>'
+    else:
+        rows = []
+        for a in appointments:
+            ts_local = (
+                datetime.fromisoformat(a["starts_at"].replace("Z", "+00:00"))
+                .astimezone(LOCAL_TZ)
+                .strftime("%a %d %b · %H:%M")
+            )
+            title = escape(a.get("title") or "Appointment")
+            loc = a.get("location")
+            loc_html = f' <span class="muted">@ {escape(loc)}</span>' if loc else ""
+            rows.append(
+                f"""
+                <div class="briefing-row">
+                  <div>
+                    <div class="briefing-title"><b>{title}</b>{loc_html}</div>
+                    <div class="muted" style="font-size:12px">{escape(ts_local)} {escape(_tz_label())}</div>
+                  </div>
+                  <div class="briefing-actions">
+                    <form method="post" action="/admin/{escape(family_id)}/appointment/{escape(a['id'])}/delete"
+                          onsubmit="return confirm('Delete this appointment?')" style="display:inline">
+                      <button type="submit" class="btn-link btn-danger">Delete</button>
+                    </form>
+                  </div>
+                </div>"""
+            )
+        body = f'<div class="briefing-list">{"".join(rows)}</div>'
+
+    return upload_form + banner + body
 
 
 def _handshake_section(family_id: str, caregivers: list[dict]) -> str:
@@ -1268,6 +1422,7 @@ _STYLES = """
   .briefing-row.briefing-new { border-color: #2d7a2d; box-shadow: 0 0 0 1px #2d7a2d; }
   .briefing-title { font-family: "SF Mono", ui-monospace, monospace; font-size: 13px; color: #c4a3ff; }
   .briefing-actions { display: flex; gap: 8px; }
+  .show-more-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; margin-top: 8px; background: #15151c; border: 1px dashed #2a2a35; border-radius: 6px; font-size: 12px; }
   .btn-link { color: #5a9adf; text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid #2a4a7a; border-radius: 5px; background: transparent; cursor: pointer; font-family: inherit; }
   .btn-link:hover { background: #1a2a3a; color: white; }
   .btn-link.btn-danger { color: #df8a8a; border-color: #6a2323; }
@@ -1404,6 +1559,37 @@ def _render_home(**ctx) -> str:
     return _page_shell(family, ctx["state"], ctx["missing"], "home", content)
 
 
+def _show_more_link(
+    family_id: str,
+    section_param: str,
+    current_n: int,
+    total: int,
+    *,
+    event_type: str | None = None,
+    days: int = 7,
+    other_param: str | None = None,
+    other_n: int | None = None,
+    anchor: str = "",
+) -> str:
+    """Render a 'Show 10 more (N of M)' link, only if there are more rows to show."""
+    shown = min(current_n, total)
+    if shown >= total:
+        return f'<div class="show-more-row muted">Showing all {total}</div>'
+    next_n = current_n + 10
+    qs = [f"{section_param}={next_n}", f"days={days}"]
+    if event_type:
+        qs.append(f"event_type={event_type}")
+    if other_param and other_n is not None:
+        qs.append(f"{other_param}={other_n}")
+    href = f"/admin/{escape(family_id)}/logs?{'&amp;'.join(qs)}{anchor}"
+    return (
+        f'<div class="show-more-row">'
+        f'<span class="muted">Showing {shown} of {total}</span>'
+        f'<a href="{href}" class="btn-link">Show 10 more</a>'
+        f'</div>'
+    )
+
+
 def _render_logs(**ctx) -> str:
     family = ctx["family"]
     fam_id = family["id"]
@@ -1418,6 +1604,29 @@ def _render_logs(**ctx) -> str:
         fam_id, ctx.get("briefings") or [], ctx.get("highlight_briefing_token")
     )
 
+    convo_more = _show_more_link(
+        fam_id,
+        "convos_n",
+        ctx["convos_n"],
+        ctx["convos_total"],
+        days=ctx["days"],
+        event_type=ctx["event_type"],
+        other_param="events_n",
+        other_n=ctx["events_n"],
+        anchor="#conversations",
+    )
+    events_more = _show_more_link(
+        fam_id,
+        "events_n",
+        ctx["events_n"],
+        ctx["events_total"],
+        days=ctx["days"],
+        event_type=ctx["event_type"],
+        other_param="convos_n",
+        other_n=ctx["convos_n"],
+        anchor="#events",
+    )
+
     content = f"""
   <h2 id="briefings">GP briefing</h2>
   {briefings_html}
@@ -1425,12 +1634,14 @@ def _render_logs(**ctx) -> str:
   <h2>Adherence (last 30 days)</h2>
   {adherence_html}
 
-  <h2>Conversations — Aunty May ↔ parent</h2>
+  <h2 id="conversations">Conversations — Aunty May ↔ parent</h2>
   {convo_html}
+  {convo_more}
 
-  <h2>Events</h2>
+  <h2 id="events">Events</h2>
   {filter_html}
-  {events_html}"""
+  {events_html}
+  {events_more}"""
 
     return _page_shell(family, ctx["state"], ctx["missing"], "logs", content)
 
@@ -1599,6 +1810,9 @@ def _render_settings(**ctx) -> str:
 
   <h2>Family settings</h2>
   {_settings_section(fam_id, family)}
+
+  <h2 id="appointments">Appointments</h2>
+  {_appointments_section(fam_id, ctx.get('appointments') or [], ctx.get('ics_added'))}
 
   <h2>Onboarding tokens</h2>
   {_handshake_section(fam_id, caregivers)}

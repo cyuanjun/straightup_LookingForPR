@@ -80,13 +80,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_text_from_parent(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """VOICE_DISABLED mode: treat text messages from the linked parent as replies.
+    """Treat text messages from the linked parent as replies.
 
     Called from onboarding.handle_yes_no_confirmation after it checks there's no
-    pending handshake — so yes/no still works during onboarding.
+    pending handshake — so yes/no still works during onboarding. Runs in any voice
+    mode: the parent may legitimately type instead of recording (mobility, accent,
+    quiet environment), and TTS-failure fallback sends text outbound — without this
+    handler the conversation breaks one-way.
     """
-    if not settings.voice_disabled:
-        return
     if update.message is None or not update.message.text:
         return
     resolved = await _resolve_parent(update)
@@ -312,12 +313,11 @@ async def _process_parent_reply(
 
     reply_text = decision.get("aunty_reply_text")
     if reply_text:
-        await send_to_parent(context.bot, chat_id, reply_text)
-        await memory_mod.record_turn(
-            family_id,
+        await send_to_parent(
+            context.bot,
             chat_id,
-            "aunty_may",
             reply_text,
+            family_id=family_id,
             language_code=language_code,
         )
 
@@ -375,7 +375,14 @@ async def _send_timing_warning(
                 f"Auntie, that was a bit late — {name} was due at {slot_str}. "
                 "Try to catch it on time tomorrow. I've noted it."
             )
-    await send_to_parent(bot, parent["telegram_chat_id"], text)
+    lang_code = "zh" if "zh" in languages else "en"
+    await send_to_parent(
+        bot,
+        parent["telegram_chat_id"],
+        text,
+        family_id=family["id"],
+        language_code=lang_code,
+    )
 
 
 async def _possible_double_dose(
@@ -408,7 +415,14 @@ async def _possible_double_dose(
         )
     from app.voice.send import send_to_parent
 
-    await send_to_parent(bot, parent["telegram_chat_id"], warn_text)
+    lang_code = "zh" if "zh" in languages else "en"
+    await send_to_parent(
+        bot,
+        parent["telegram_chat_id"],
+        warn_text,
+        family_id=family_id,
+        language_code=lang_code,
+    )
 
     # DM all caregivers with full context
     caregivers = await users_repo.list_caregivers(family_id)

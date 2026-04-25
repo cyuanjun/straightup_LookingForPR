@@ -156,23 +156,32 @@ DECIDE_FUNCTION = {
 
 BRIEFING_SYSTEM = """Compile 6 weeks of medication-adherence + symptom-diary events into a one-page GP briefing.
 
-Sections (markdown):
-  1. Medication adherence timeline (percentages, pattern callouts)
-  2. Recurring symptoms (top 3, with frequency + trend)
-  3. New-onset signals (things mentioned in last 2 weeks, not before)
-  4. Family notes / questions for the GP
+Required sections, in this order:
+
+**Regimen** — bulleted list of every active medication: `<name> <dose> <freq>` (BID for twice daily, TID for three times daily, QD for once daily, etc.) plus the slot times. Example: `- Atorvastatin 20mg BID — 08:00, 20:00`. One line per drug. This anchors the GP before they read the rest.
+
+**1. Medication adherence**
+  - One bullet per medication: `<name>: NN% (X confirmed / Y missed of Z scheduled doses)`. Compute Z = confirmed + missed_resolved + missed_unresolved for that medication. Adherence % = (confirmed + missed_resolved) / Z. Round to whole percent.
+  - Then a "Slot patterns" sub-bullet per medication that has misses: which slot time(s) get missed most. e.g. "Most misses at 20:00 slot (3 of 4)". Skip this if no misses or no clear concentration.
+  - Then a "Late recoveries" sub-bullet if missed_resolved doses exist: "Took late after reminder N times" — meaningful because it implies the parent needed the family-group escalation, not the original reminder.
+
+**2. Recurring symptoms** — top 3 by mention count over the window. Format: `<symptom>: reported N times. <trend>` where trend = "stable", "increasing in last 2 weeks", or "isolated cluster on <date range>". Be specific with numbers.
+
+**3. New-onset signals** — symptoms or concerns mentioned in the last 14 days that have no earlier mentions in the window. For each, include the first-mention date: `<symptom>: first reported <date>, mentioned N times since`. If none, write "None observed."
+
+**4. Auto-suggested questions for GP review** — 2–3 questions the family caregivers might want to raise, derived directly from the data above. Prefix the section heading exactly so it's clear these are LLM-suggested, not transcribed from family input. Skip the section entirely if there's nothing data-grounded to suggest.
 
 Data sources in the JSON context:
   - `dose_outcomes` — canonical per-dose lifecycle; trust this for adherence. Each
-    row has status ∈ {confirmed, missed_resolved, missed_unresolved, pending} and
-    timing ∈ {on_time, early, late, null}. For adherence % = (confirmed +
-    missed_resolved) / (confirmed + missed_resolved + missed_unresolved). Treat
-    `missed_resolved` as "late recovery" (took it, but only after the reminder
-    window closed + family group escalation). Ignore `pending` rows.
+    row has medication, scheduled_at, slot, status ∈ {confirmed, missed_resolved,
+    missed_unresolved, pending}, timing ∈ {on_time, early, late, null}.
+    Ignore `pending` rows.
   - `events` — audit trail; use for symptoms, clinical questions, distress
-    escalations, conversation context. Do NOT recount adherence from events.
+    escalations. Do NOT recount adherence from events — the dose_outcomes
+    already captured every reminder/miss/confirm.
+  - `active_medications` — for the Regimen section.
 
-Clinical, compressed, 300 words max. Compile only — do not interpret.
+Tone: clinical, compressed, factual. **Compile only — do not interpret.** Do not say "could be statin myalgia" or suggest causes. Surface the data; let the GP do the clinical reasoning. 300 words max.
 """
 
 

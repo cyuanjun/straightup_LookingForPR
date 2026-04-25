@@ -4,11 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-The repo is **design-only** — no code, no build system, no tests. The source of truth is [plan.md](plan.md), a 12-section build plan for a 5-day hackathon. Before making non-trivial changes or starting implementation, read `plan.md` end-to-end — it has the product, architecture, data model, prompts, scheduler, bot commands, and scope decisions.
+MVP is **built and running**. The product spec lives in [plan.md](plan.md) (12 sections — product, data model, prompts, scheduler, scope). For setup + run instructions, see [README.md](README.md).
 
-[archive/second-shift.md](archive/second-shift.md) is the *original* spec we iterated from. It has pitch-strategy content (judge alignment, risks, market context, roadmap, pitch deck outline) that didn't port to `plan.md` but remains useful for pitch prep. It is **stale on feature-level content** — do not treat it as authoritative for the build.
+[archive/second-shift.md](archive/second-shift.md) is the *original* spec. Pitch-strategy content (judge alignment, risks, market context) only — **stale on feature-level content**, do not treat as authoritative.
 
-When the first code lands, extend this file with the actual build / test / lint commands. Do not invent commands before they exist.
+## Commands
+
+```bash
+# Run the bot + admin dashboard locally (requires .env + cloudflared tunnel running)
+uvicorn main:app --reload --port 8000
+
+# Spine smoke test — fires reminder + miss + escalation + check-back without the wall clock
+python scripts/fire_demo.py --fast --missed
+
+# Pre-warm TTS cache (run before demo day; cached files survive in cache/audio/)
+python scripts/prewarm_audio.py
+```
+
+No tests, no linter wired. Demo readiness is verified by running fire_demo + visual check of the admin dashboard at `/admin/<family_id>`.
+
+## Data-model gotchas
+
+- **`dose_instances` is canonical for adherence** ([app/db/doses.py](app/db/doses.py)). Events are the audit log; doses are the lifecycle state (`pending → confirmed | missed_unresolved → missed_resolved`). Never compute adherence by pairing `med_reminder_sent` / `med_missed` / `med_confirmed` events — the dose row already knows the outcome.
+- **Table is `medication` (singular)**. Renamed from `medications` post-MVP. The Python module is [app/db/medication.py](app/db/medication.py) and the alias is `medication_repo`.
+- **Service-role key bypasses RLS**. Every repo method MUST scope by `family_id` in code. RLS is defense-in-depth, not the actual access control.
+- **Scheduler DSN is port 5432 (Session), NOT 6543 (PgBouncer)**. APScheduler's SQLAlchemy job store needs prepared statements, which the pooler doesn't support.
 
 ## Product in one line
 
@@ -45,7 +65,8 @@ All reasoning happens on **text**. Voice is the user-facing I/O boundary — Ele
 
 ### Integration reality
 
-- **Actually wired in MVP:** Telegram bot (both surfaces), end-to-end Aunty May voice loop, on-duty rotation, nudge counter + weekly digest, GP briefing PDF generation, `.ics` upload + appointment reminders
+- **Actually wired:** Telegram bot (parent DM + family group), end-to-end Aunty May voice/text loop with timing-aware confirmation, on-duty rotation, weekly Friday digest with coverage stats, dose lifecycle tracking, weekly Monday-morning group update (week ahead + adherence + appointments), daily 20:00 parent check-in, GP briefing PDF (one-page, QR), `.ics` upload via the admin dashboard → appointments table → surfaced in the weekly Monday update, web admin dashboard at `/admin/<family_id>` with Home / Medications / Logs / Settings (Settings has the .ics upload + appointment list).
+- **Designed but not yet wired:** standalone day-before `appointment_reminder_due` jobs (plan §10) — currently appointments only surface in the Monday weekly update, no per-appointment cron yet. RRULE expansion in `.ics` (single events only).
 - **Explicitly out of MVP scope (don't reintroduce):** bill payment execution, appointment booking via API, signed receipts feed (E2), MERaLiON STT, Next.js frontend, MCP servers, separate auth layer (Clerk/Supabase Auth)
 
 Out-of-scope items were cut after scope + API-constraint analysis — not oversights.
