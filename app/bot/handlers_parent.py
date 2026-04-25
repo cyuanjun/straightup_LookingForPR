@@ -149,11 +149,15 @@ async def _process_parent_reply(
             matched_med_name = matched["name"]
 
     memory = await memory_mod.fetch_recent(family_id, chat_id, n=12)
+    # The family's configured `languages` is authoritative for reply language —
+    # STT auto-detection (`language_code`) can misfire on accented Mandarin and
+    # tag the input as Korean / Japanese, which would force the LLM to reply in
+    # the wrong language. Trust the explicit Setting first.
     decision = await decide_mod.decide(
         intent,
         memory_turns=memory,
         caregiver_name=caregiver_name,
-        parent_language_hint=language_code or family.get("languages"),
+        parent_language_hint=family.get("languages") or language_code,
         matched_medication_name=matched_med_name,
     )
 

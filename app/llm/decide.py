@@ -39,6 +39,8 @@ async def decide(
         )
 
     # Translate language code to an explicit description so GPT-4o doesn't guess.
+    # Only known-good codes pass through — anything else (e.g. STT misfires like 'ko')
+    # falls back to the Singapore default, never propagated raw to the prompt.
     _lang_map = {
         "zh+en": "Mandarin with English code-switching (Singapore context)",
         "zh": "Mandarin",
@@ -47,10 +49,8 @@ async def decide(
         "en": "English",
         "en-SG": "Singapore English",
     }
-    lang_desc = (
-        _lang_map.get(parent_language_hint or "", parent_language_hint)
-        or "Mandarin with English code-switching (Singapore context)"
-    )
+    _DEFAULT_LANG = "Mandarin with English code-switching (Singapore context)"
+    lang_desc = _lang_map.get(parent_language_hint or "", _DEFAULT_LANG)
 
     med_line = (
         f"Matched medication: {matched_medication_name}\n"
